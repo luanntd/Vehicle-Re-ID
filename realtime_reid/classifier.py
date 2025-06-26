@@ -21,12 +21,12 @@ class VehicleReID:
         }
         
         # Initialize embeddings dictionary for different vehicle types
-        # Keys are vehicle class indices (2: car, 3: motorcycle, 5: bus, 7: truck)
+        # Keys are vehicle class indices (0: motorcycle, 1: car, 2: truck, 3: bus)
         self.embeddings = {
-            2: torch.Tensor().to(device),  # cars
-            3: torch.Tensor().to(device),  # motorcycles
-            5: torch.Tensor().to(device),  # buses
-            7: torch.Tensor().to(device)   # trucks
+            0: torch.Tensor().to(device),  # motorcycles
+            1: torch.Tensor().to(device),  # cars
+            2: torch.Tensor().to(device),  # trucks
+            3: torch.Tensor().to(device)   # buses
         }
         
         # Initialize IDs for each vehicle type
@@ -66,7 +66,7 @@ class VehicleReID:
         target: torch.Tensor
             Feature vector of the vehicle to identify
         vehicle_type: int
-            Class index of the vehicle (2: car, 3: motorcycle, 5: bus, 7: truck)
+            Class index of the vehicle (0: motorcycle, 1: car, 2: truck, 3: bus)
         confidence: float
             Detection confidence from YOLO
         do_update: bool
