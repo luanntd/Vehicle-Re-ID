@@ -112,40 +112,28 @@ class Pipeline:
                         cv2.imwrite(os.path.join(match_dir, f"{entry['tag']}_track{entry['track_id']}.jpg"), entry['image'])
                         saved.add(key)
 
-        # Draw bounding boxes and labels
-        for vtype in self.vehicle_by_type:
-            for entry in self.vehicle_by_type[vtype]:
-                vehicle_id = entry['id']
-                # Find corresponding detected box for this vehicle
-                for detected_box in detected_data.boxes:
-                    if int(detected_box.cls) == vtype:
-                        xyxy = detected_box.xyxy.squeeze().tolist()
-                        xmin, ymin, xmax, ymax = map(int, xyxy)
-                        cls = vtype
 
-                        # Create label with vehicle ID and type
-                        vehicle_type = VEHICLE_LABELS.get(cls, f'class_{cls}')
-                        label = f"ID:{vehicle_id} ({vehicle_type})"
+            # Create label with vehicle ID and type
+            label = f"ID:{vehicle_id} ({vehicle_type})"
 
-                        # Draw bounding box and label
-                        unique_color = color.create_unique_color(vehicle_id)
-                        cv2.rectangle(
-                            img=final_img,
-                            pt1=(xmin, ymin),
-                            pt2=(xmax, ymax),
-                            color=unique_color,
-                            thickness=2,
-                        )
-                        cv2.putText(
-                            img=final_img,
-                            text=label,
-                            org=(xmin, ymin - 5),
-                            fontFace=cv2.FONT_HERSHEY_SIMPLEX,
-                            fontScale=0.6,
-                            color=unique_color,
-                            thickness=2,
-                        )
-                        break  # Found the matching box, move to next vehicle
+            # Draw bounding box and label
+            unique_color = color.create_unique_color(vehicle_id)
+            cv2.rectangle(
+                img=final_img,
+                pt1=(xmin, ymin),
+                pt2=(xmax, ymax),
+                color=unique_color,
+                thickness=2,
+            )
+            cv2.putText(
+                img=final_img,
+                text=label,
+                org=(xmin, ymin - 5),
+                fontFace=cv2.FONT_HERSHEY_SIMPLEX,
+                fontScale=0.6,
+                color=unique_color,
+                thickness=2,
+            )
 
         if return_bytes:
             return cv2.imencode(
