@@ -7,9 +7,10 @@ from pyspark.sql.types import BinaryType
 from realtime_reid.pipeline import Pipeline
 
 def start_spark():
-    SCALA_VERSION = '2.12'
-    SPARK_VERSION = '3.5.0'
-    KAFKA_VERSION = '3.6.0'
+    # Use Spark/Scala/Kafka versions that actually exist and match your Spark install
+    SCALA_VERSION = '2.13'  # Change to your Scala version if different
+    SPARK_VERSION = '4.0.0'  # Change to your installed Spark version if different
+    KAFKA_VERSION = '3.5.0'  # Should match Spark version, not Kafka server version
 
     packages = [
         f'org.apache.spark:spark-sql-kafka-0-10_{SCALA_VERSION}:{SPARK_VERSION}',
@@ -46,13 +47,13 @@ def start_spark():
         df = df.withColumn("value", df["value"].cast(BinaryType()))
 
         @udf(BinaryType())
-        def process_frame(value):
+        def process_frame(value, tag):
             print("[UDF] process_frame called")
             frame = np.frombuffer(value, dtype=np.uint8)
             print(f"[UDF] Frame buffer length: {len(frame)}")
             frame = frame.tobytes()
             try:
-                frame_bytes = vehicle_pipeline.process(frame, return_bytes=True)
+                frame_bytes = vehicle_pipeline.process(frame, tag, return_bytes=True)
                 print("[UDF] vehicle_pipeline.process finished")
             except Exception as e:
                 print(f"[UDF] ERROR in vehicle_pipeline.process: {e}")
@@ -64,7 +65,7 @@ def start_spark():
             .selectExpr("CAST(key AS STRING)",
                        "CAST(topic as STRING)",
                        "value") \
-            .withColumn("value", process_frame("value"))
+            .withColumn("value", process_frame("value", "topic"))
 
         # Define output Kafka parameters
         write_params = [
@@ -76,7 +77,7 @@ def start_spark():
 
         # Write processed frames back to Kafka
         query_topic1 = processed_df \
-            .filter("topic = 'topic_camera_00'") \
+            .filter("topic = 'cam1'") \
             .writeStream \
             .format("kafka") \
             .options(**write_params[0]) \
@@ -85,7 +86,7 @@ def start_spark():
             .start()
 
         query_topic2 = processed_df \
-            .filter("topic = 'topic_camera_01'") \
+            .filter("topic = 'cam2'") \
             .writeStream \
             .format("kafka") \
             .options(**write_params[1]) \
