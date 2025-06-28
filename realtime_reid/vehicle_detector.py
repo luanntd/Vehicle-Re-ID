@@ -6,7 +6,7 @@ from ultralytics import YOLO
 device = 0 if torch.cuda.is_available() else "cpu"
 
 class VehicleDetector:
-    def __init__(self, model_path: str = 'best_20.pt'):
+    def __init__(self, model_path: str = 'yolo11n.pt'):
         # Load Model path
         self.model_path = model_path
         # Vehicle classes: motorcycle(0), car(1), truck(2), bus(3) 

@@ -69,7 +69,6 @@ class Pipeline:
             cls = int(detected_box.cls)
             conf = float(detected_box.conf)
             track_id = int(detected_box.id) if detected_box.id is not None else -1
-            print(f"Current tracking ID: {track_id}, Class: {cls}, Confidence: {conf}")
 
             # Crop vehicle image
             vehicle_img = final_img[ymin:ymax, xmin:xmax, :]

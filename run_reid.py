@@ -1,10 +1,13 @@
 import cv2
 import os
-import numpy as np
+from realtime_reid.vehicle_detector import VehicleDetector
+from realtime_reid.feature_extraction import VehicleDescriptor
 from realtime_reid.pipeline import Pipeline
 
 def run_reid_on_two_videos(video_path1, video_path2, save_dir=None):
-    pipeline = Pipeline()
+    detector = VehicleDetector(model_path='checkpoints/best_20.pt')
+    descriptor = VehicleDescriptor(model_type='osnet', model_path='checkpoints/best_osnet_model.pth')
+    pipeline = Pipeline(detector=detector, descriptor=descriptor)
     cap1 = cv2.VideoCapture(video_path1)
     cap2 = cv2.VideoCapture(video_path2)
 
