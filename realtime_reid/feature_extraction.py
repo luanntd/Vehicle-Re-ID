@@ -127,25 +127,28 @@ class VehicleDescriptor:
                  model_path=None,
                  model_type='osnet',  # 'osnet', 'resnet_ibn', 'efficientnet'
                  input_size=(256, 256),
-                 feature_dim=512):
+                 feature_dim=512,
+                 num_classes=1000):
         
+        self.model_path = model_path
         self.input_size = input_size
         self.model_type = model_type
         self.feature_dim = feature_dim
+        self.num_classes = num_classes
         
-        print(f"Using model type: {model_type} with input size: {input_size} and feature dimension: {feature_dim}")
+        print(f"Using model type: {model_type} with input size: {input_size}, num classes {num_classes} and feature dimension: {feature_dim}")
         # Initialize the model based on type
         if model_type == 'osnet':
-            self.model = OSNet(feature_dim=feature_dim)
+            self.model = OSNet(num_classes=num_classes, feature_dim=feature_dim)
         elif model_type == 'resnet_ibn':
-            self.model = ResNetIBN(feature_dim=feature_dim)
+            self.model = ResNetIBN(num_classes=num_classes, feature_dim=feature_dim)
         elif model_type == 'efficientnet':
             self.model = self._create_efficientnet_model(feature_dim)
         else:
             raise ValueError(f"Unknown model type: {model_type}")
         
         # Load custom weights if provided
-        if model_path:
+        if self.model_path:
             self._load_model_weights(model_path)
         
         self.model = self.model.to(device)
@@ -190,14 +193,24 @@ class VehicleDescriptor:
         try:
             if self.model_type == 'efficientnet':
                 # For EfficientNet, load full state dict
-                self.model.load_state_dict(torch.load(model_path, map_location=device))
+                self.model.load_state_dict(torch.load(model_path, map_location=device, weights_only=False))
             else:
                 # For custom models (OSNet, ResNetIBN), load with strict=False
-                checkpoint = torch.load(model_path, map_location=device)
+                checkpoint = torch.load(model_path, map_location=device, weights_only=False)
                 if 'model_state_dict' in checkpoint:
-                    self.model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+                    state_dict = checkpoint['model_state_dict']
                 else:
-                    self.model.load_state_dict(checkpoint, strict=False)
+                    state_dict = checkpoint
+                
+                # Remove classifier layers
+                state_dict_filtered = {}
+                for k, v in state_dict.items():
+                    if k.startswith('classifier.'):
+                        print(f"Skipping classifier layer: {k} (shape mismatch)")
+                        continue
+                    state_dict_filtered[k] = v
+                
+                self.model.load_state_dict(state_dict_filtered, strict=False)
             print(f"Successfully loaded model weights from {model_path}")
         except Exception as e:
             print(f"Warning: Could not load model weights from {model_path}: {e}")
@@ -283,7 +296,7 @@ class VehicleDescriptor:
         }
 
 # Example usage and model factory
-def create_vehicle_descriptor(model_type='osnet', model_path=None, input_size=(256, 256)):
+def create_vehicle_descriptor(model_type='osnet', model_path=None, input_size=(256, 256), num_classes=1000):
     """
     Factory function to create VehicleDescriptor with different models
     
@@ -295,21 +308,6 @@ def create_vehicle_descriptor(model_type='osnet', model_path=None, input_size=(2
     return VehicleDescriptor(
         model_path=model_path,
         model_type=model_type,
-        input_size=input_size
+        input_size=input_size,
+        num_classes=num_classes
     )
-
-# Pretrained model URLs (you'll need to download these)
-PRETRAINED_MODELS = {
-    'osnet_x1_0': {
-        'url': 'https://drive.google.com/file/d/1LaG1EJpHrxdAxKnSCJ_i0u-nbxSAeiFY/view',
-        'description': 'OSNet trained on multiple vehicle datasets'
-    },
-    'resnet50_ibn_a': {
-        'url': 'https://drive.google.com/file/d/1thS2B8UOSBi_cJX6zRy6YYRwz_nVFI_S/view',
-        'description': 'ResNet50-IBN-a for domain adaptation'
-    },
-    'efficientnet_vehicle': {
-        'url': 'https://github.com/KaiyangZhou/deep-person-reid/releases/download/v1.0.0/osnet_x1_0_imagenet.pth',
-        'description': 'EfficientNet fine-tuned on vehicle datasets'
-    }
-}

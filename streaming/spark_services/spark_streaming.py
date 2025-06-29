@@ -5,6 +5,8 @@ from pyspark.sql import SparkSession
 from pyspark.sql.functions import udf
 from pyspark.sql.types import BinaryType
 from realtime_reid.pipeline import Pipeline
+from realtime_reid.vehicle_detector import VehicleDetector
+from realtime_reid.feature_extraction import VehicleDescriptor
 
 def start_spark():
     # Use Spark/Scala/Kafka versions that actually exist and match your Spark install
@@ -20,7 +22,9 @@ def start_spark():
     findspark.init()
 
     def spark_streaming_thread():
-        vehicle_pipeline = Pipeline()
+        detector = VehicleDetector(model_path='best_20.pt')
+        descriptor = VehicleDescriptor(model_type='osnet')
+        vehicle_pipeline= Pipeline(detector=detector, descriptor=descriptor)
 
         # Initialize Spark session
         spark = SparkSession.builder \
