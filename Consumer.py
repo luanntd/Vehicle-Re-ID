@@ -43,31 +43,35 @@ TOPIC_2 = args['topic_2']
 # Create a Queue to hold the processed images
 processed_images = Queue()
 
-def process_messages(consumer: KafkaConsumer,
-                     consumer_name: str):
+def process_messages(consumer: KafkaConsumer):
     for msg in consumer:
         # Process the message - directly display processed frames from Spark
         final_img = np.frombuffer(msg.value, dtype=np.uint8)
         final_img = cv2.imdecode(final_img, cv2.IMREAD_COLOR)
-        processed_images.put((consumer_name, final_img))
         #Check if final_img is None
         if final_img is None:
-            print(f"Received None image from {consumer_name}, skipping...")
+            print(f"Received None image from {msg.topic}, skipping...")
             continue
+        processed_images.put((msg.topic, final_img))
+        print(f"Received message from {msg.topic}, frame size: {final_img.shape}")
 def start_threads(consumer_00: KafkaConsumer,
                   consumer_01: KafkaConsumer):
     """Start processing messages from both topics using threads"""
     thread_0 = threading.Thread(
         target=process_messages,
-        args=(consumer_00, "Camera 00")
+        args=(consumer_00,)
     )
-    thread_1 = threading.Thread(
-        target=process_messages,
-        args=(consumer_01, "Camera 01")
-    )
+    if consumer_01 is not None:
+        thread_1 = threading.Thread(
+            target=process_messages,
+            args=(consumer_01,)
+        )
+    else:
+        thread_1 = None
 
     thread_0.start()
-    thread_1.start()
+    if thread_1 is not None:
+        thread_1.start()
 
     return thread_0, thread_1
 
@@ -93,7 +97,7 @@ def save_processed_videos(processed_images, save_dir):
                 h, w = frame.shape[:2]
                 output_path = os.path.join(save_dir, f"{consumer_name}.mp4")
                 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                writers[consumer_name] = cv2.VideoWriter(output_path, fourcc, 30, (w, h))
+                writers[consumer_name] = cv2.VideoWriter(output_path, fourcc, 6, (w, h))
                 frame_sizes[consumer_name] = (w, h)
                 print(f"Started writing video for {consumer_name} to {output_path}")
             # Resize if needed
@@ -101,6 +105,7 @@ def save_processed_videos(processed_images, save_dir):
             if (frame.shape[1], frame.shape[0]) != (w, h):
                 frame = cv2.resize(frame, (w, h))
             writers[consumer_name].write(frame)
+            print(f"Processed frame from {consumer_name}, size: {frame.shape}")
     except KeyboardInterrupt:
         print("Interrupted. Finalizing video files...")
     finally:
@@ -113,6 +118,9 @@ def display_images():
     while True:
         # Get the next processed image and display it
         consumer_name, final_img = processed_images.get()
+        if final_img is None:
+            print(f"Received None image from {consumer_name}, skipping...")
+            continue
         final_img = cv2.resize(final_img, (640, 480))  # Resize for better visibility
         cv2.imshow(consumer_name, final_img)
         sleep_time = 0.5  # Adjust sleep time as needed
@@ -153,10 +161,13 @@ def main():
     # Start Spark streaming
     from streaming.spark_services.spark_streaming import start_spark
     spark_thread = threading.Thread(target=start_spark)
-    print("Starting Spark streaming...")
-    spark_thread.start()
-    print("Spark streaming started.")
-
+    try:
+        print("Starting Spark streaming...")
+        spark_thread.start()
+        print("Spark streaming started.")
+    except KeyboardInterrupt:
+        print("Spark streaming interrupted by user.")
+        
     # Ensure Kafka topics exist
     consumer_00 = ensure_kafka_topic(TOPIC_1 + "_processed", BOOTSTRAP_SERVERS)
     if TOPIC_2 and TOPIC_2 != "NULL":
@@ -173,7 +184,8 @@ def main():
 
     # Wait for both threads to finish
     thread_0.join()
-    thread_1.join()
+    if thread_1 is not None:
+        thread_1.join()
 
     # Closes all the frames
     cv2.destroyAllWindows()
