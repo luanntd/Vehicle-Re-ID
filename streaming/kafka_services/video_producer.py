@@ -2,7 +2,7 @@ import os
 import time
 import cv2
 from kafka import KafkaProducer
-
+import tqdm
 class VideoProducer:
     def __init__(
             self,
@@ -18,8 +18,12 @@ class VideoProducer:
         self.producer = KafkaProducer(bootstrap_servers=bootstrap_servers)
         self.TOPIC = topic
 
-    def encode_and_produce(self, frame, interval: float):
+    def encode_and_produce(self, frame, interval: float, frame_count: int = 0):
         """Process and send a single frame to Kafka."""
+        # Only send every 5th frame
+        if frame_count % 5 != 0:
+            return
+            
         frame = self.process_frame(frame)
 
         # Convert frame to jpg format
@@ -54,16 +58,22 @@ class VideoProducer:
     def _publish_from_video(self, video_path: str):
         """Publish frames from a video file."""
         video = cv2.VideoCapture(video_path)
-
+        progress_bar = tqdm.tqdm(
+            total=int(video.get(cv2.CAP_PROP_FRAME_COUNT)),
+            desc=f"Publishing {os.path.basename(video_path)}",
+            unit="frames"
+        )
         # Use video FPS if no interval specified
         if self.INTERVAL == -1:
             self.INTERVAL = 1 / video.get(cv2.CAP_PROP_FPS)
-
+        frame_count = 0
         while video.isOpened():
             success, frame = video.read()
             if not success:
                 break
-            self.encode_and_produce(frame, self.INTERVAL)
+            self.encode_and_produce(frame, self.INTERVAL, frame_count)
+            frame_count += 1
+            progress_bar.update(1)
 
         video.release()
 
