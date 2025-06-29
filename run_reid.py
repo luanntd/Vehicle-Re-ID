@@ -92,7 +92,7 @@ def run_reid_on_two_videos(video_path1, video_path2, save_dir=None, process_ever
                         frame2 = cv2.resize(frame2, (width2, height2))
                     
                     # Process frame directly without encoding/decoding
-                    result2 = pipeline.process_frame(frame2, 'cam2')
+                    result2 = pipeline.process(frame2, 'cam2')
                     if save_dir and result2 is not None:
                         out2.write(result2)
                     
