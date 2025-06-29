@@ -37,16 +37,57 @@ class VehicleDetector:
         results = self.yolo(image, classes=self.vehicle_classes, device=device, conf=0.35)
         return results
 
-    def track(self, input_bytes: bytes, camera_id: str, tracker: str = "bytetrack.yaml"):
+    # def track(self, input_bytes: bytes, camera_id: str, tracker: str = "bytetrack.yaml"):
+    #     """
+    #     Track vehicles in a single camera feed.
+        
+    #     Parameters
+    #     ----------
+    #     frame_bytes: bytes
+    #         Frame from specific camera
+    #     camera_id: str
+    #         Unique identifier for the camera (e.g., "cam_1", "cam_2")
+    #     timestamp: float
+    #         Timestamp of the frame (for temporal reasoning)
+            
+    #     Returns
+    #     -------
+    #     dict: Contains local tracking results and global vehicle IDs
+    #     """
+            
+    #     # Convert bytes to image
+    #     image = cv2.imdecode(
+    #         np.frombuffer(input_bytes, np.uint8),
+    #         cv2.IMREAD_COLOR
+    #     )
+
+    #     # Create separate tracker instance for each camera
+    #     if camera_id not in self.camera_trackers:
+    #         self.camera_trackers[camera_id] = YOLO(self.model_path)
+
+    #     # Track vehicles in this specific camera
+    #     results = self.camera_trackers[camera_id].track(
+    #         image,
+    #         classes=self.vehicle_classes,
+    #         device=device,
+    #         conf=0.35,
+    #         tracker=tracker,
+    #         persist=True,
+    #         verbose=False
+    #     )
+
+    #     return results
+    
+    def track(self, image, camera_id, tracker: str = "bytetrack.yaml"):
         """
-        Track vehicles in a single camera feed.
+        Track vehicles in a frame directly without byte conversion.
         
         Parameters
         ----------
-        frame_bytes: bytes
-            Frame from specific camera
+        image: np.ndarray
+            OpenCV image array (BGR format)
         camera_id: str
-            Unique identifier for the camera (e.g., "cam_1", "cam_2")
+            Camera identifier for tracking persistence
         timestamp: float
             Timestamp of the frame (for temporal reasoning)
             
@@ -54,13 +95,6 @@ class VehicleDetector:
         -------
         dict: Contains local tracking results and global vehicle IDs
         """
-            
-        # Convert bytes to image
-        image = cv2.imdecode(
-            np.frombuffer(input_bytes, np.uint8),
-            cv2.IMREAD_COLOR
-        )
-
         # Create separate tracker instance for each camera
         if camera_id not in self.camera_trackers:
             self.camera_trackers[camera_id] = YOLO(self.model_path)
@@ -72,7 +106,8 @@ class VehicleDetector:
             device=device,
             conf=0.35,
             tracker=tracker,
-            persist=True
+            persist=True,
+            verbose=False
         )
 
         return results
