@@ -1,5 +1,6 @@
 import threading
 import numpy as np
+import cv2
 import findspark
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import udf
@@ -53,16 +54,36 @@ def start_spark():
         @udf(BinaryType())
         def process_frame(value, tag):
             print("[UDF] process_frame called")
-            frame = np.frombuffer(value, dtype=np.uint8)
-            print(f"[UDF] Frame buffer length: {len(frame)}")
-            frame = frame.tobytes()
             try:
-                frame_bytes = vehicle_pipeline.process(frame, tag, return_bytes=True)
+                # Decode bytes to OpenCV frame
+                frame_buffer = np.frombuffer(value, dtype=np.uint8)
+                frame = cv2.imdecode(frame_buffer, cv2.IMREAD_COLOR)
+                
+                if frame is None:
+                    print("[UDF] ERROR: Could not decode frame")
+                    return value  # Return original bytes if decoding fails
+                
+                print(f"[UDF] Frame decoded successfully: {frame.shape}")
+                
+                # Process frame directly (no encoding/decoding)
+                processed_frame = vehicle_pipeline.process(frame, tag)
+                
+                # Encode result back to bytes for Kafka
+                _, buffer = cv2.imencode('.jpg', processed_frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                result_bytes = buffer.tobytes()
+                
                 print("[UDF] vehicle_pipeline.process finished")
+                
+                # Clean up memory
+                del frame_buffer, frame, processed_frame, buffer
+                
+                return result_bytes
+                
             except Exception as e:
-                print(f"[UDF] ERROR in vehicle_pipeline.process: {e}")
-                raise
-            return frame_bytes
+                print(f"[UDF] ERROR in process_frame: {e}")
+                import gc
+                gc.collect()
+                return value  # Return original bytes on error
 
         # Process frames
         processed_df = df \

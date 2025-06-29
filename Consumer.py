@@ -42,18 +42,41 @@ TOPIC_2 = args['topic_2']
 
 # Create a Queue to hold the processed images
 processed_images = Queue()
+# Frame counter for memory management
+frame_counter = 0
 
 def process_messages(consumer: KafkaConsumer):
+    global frame_counter
     for msg in consumer:
-        # Process the message - directly display processed frames from Spark
-        final_img = np.frombuffer(msg.value, dtype=np.uint8)
-        final_img = cv2.imdecode(final_img, cv2.IMREAD_COLOR)
-        #Check if final_img is None
-        if final_img is None:
-            print(f"Received None image from {msg.topic}, skipping...")
-            continue
-        processed_images.put((msg.topic, final_img))
-        print(f"Received message from {msg.topic}, frame size: {final_img.shape}")
+        try:
+            # Process the message - directly display processed frames from Spark
+            frame_buffer = np.frombuffer(msg.value, dtype=np.uint8)
+            final_img = cv2.imdecode(frame_buffer, cv2.IMREAD_COLOR)
+            
+            # Check if final_img is None
+            if final_img is None:
+                print(f"Received None image from {msg.topic}, skipping...")
+                del frame_buffer  # Clean up even on failure
+                continue
+                
+            processed_images.put((msg.topic, final_img))
+            print(f"Received message from {msg.topic}, frame size: {final_img.shape}")
+            
+            # Clean up memory
+            del frame_buffer
+            frame_counter += 1
+            
+            # Garbage collection every 50 frames
+            if frame_counter % 50 == 0:
+                import gc
+                gc.collect()
+                print(f"Processed {frame_counter} frames, memory cleaned")
+                
+        except Exception as e:
+            print(f"Error processing message from {msg.topic}: {e}")
+            import gc
+            gc.collect()
+
 def start_threads(consumer_00: KafkaConsumer,
                   consumer_01: KafkaConsumer):
     """Start processing messages from both topics using threads"""

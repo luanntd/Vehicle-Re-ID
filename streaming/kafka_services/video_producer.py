@@ -24,13 +24,21 @@ class VideoProducer:
         if frame_count % 5 != 0:
             return
             
-        frame = self.process_frame(frame)
+        processed_frame = self.process_frame(frame)
 
         # Convert frame to jpg format
-        _, buffer = cv2.imencode('.jpg', frame)
+        _, buffer = cv2.imencode('.jpg', processed_frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
 
         # Send to Kafka
         self.producer.send(self.TOPIC, buffer.tobytes())
+        
+        # Clean up memory
+        del processed_frame, buffer
+        
+        # Garbage collection every 100 frames
+        if frame_count % 100 == 0:
+            import gc
+            gc.collect()
 
         time.sleep(interval)
 
