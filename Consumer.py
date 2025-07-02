@@ -1,8 +1,4 @@
 import os
-# os.environ["JAVA_HOME"] = r"C:\Program Files\Java\jdk-17"
-# os.environ["SPARK_HOME"] = r"C:\spark\spark-3.5.5-bin-hadoop3"
-# os.environ["PATH"] = os.environ["JAVA_HOME"] + r"\bin;" + os.environ["SPARK_HOME"] + r"\bin;" + os.environ["PATH"]
-
 import argparse
 import cv2
 from queue import Queue
@@ -44,38 +40,56 @@ TOPIC_2 = args['topic_2']
 processed_images = Queue()
 # Frame counter for memory management
 frame_counter = 0
+# Timeout monitoring
+last_message_time = time.time()
+timeout_seconds = 300
+should_exit = False
+# Frame rate tracking for each camera
+camera_frame_times = {}
+camera_frame_counts = {}
 
 def process_messages(consumer: KafkaConsumer):
     global frame_counter
-    for msg in consumer:
-        try:
-            # Process the message - directly display processed frames from Spark
-            frame_buffer = np.frombuffer(msg.value, dtype=np.uint8)
-            final_img = cv2.imdecode(frame_buffer, cv2.IMREAD_COLOR)
-            
-            # Check if final_img is None
-            if final_img is None:
-                print(f"Received None image from {msg.topic}, skipping...")
-                del frame_buffer  # Clean up even on failure
-                continue
+    print(f"Starting to consume messages from topic: {consumer.subscription()}")
+    try:
+        for msg in consumer:
+            try:
+                # Process the message - directly display processed frames from Spark
+                frame_buffer = np.frombuffer(msg.value, dtype=np.uint8)
+                final_img = cv2.imdecode(frame_buffer, cv2.IMREAD_COLOR)
                 
-            processed_images.put((msg.topic, final_img))
-            print(f"Received message from {msg.topic}, frame size: {final_img.shape}")
-            
-            # Clean up memory
-            del frame_buffer
-            frame_counter += 1
-            
-            # Garbage collection every 50 frames
-            if frame_counter % 50 == 0:
+                # Check if final_img is None
+                if final_img is None:
+                    print(f"Received None image from {msg.topic}, skipping...")
+                    del frame_buffer  # Clean up even on failure
+                    continue
+                    
+                processed_images.put((msg.topic, final_img))
+                print(f"Received message from {msg.topic}, frame size: {final_img.shape}")
+                
+                # Clean up memory
+                del frame_buffer
+                frame_counter += 1
+                
+                # Garbage collection every 50 frames
+                if frame_counter % 50 == 0:
+                    import gc
+                    gc.collect()
+                    print(f"Processed {frame_counter} frames, memory cleaned")
+                    
+            except Exception as e:
+                print(f"Error processing message from {msg.topic}: {e}")
                 import gc
                 gc.collect()
-                print(f"Processed {frame_counter} frames, memory cleaned")
-                
-        except Exception as e:
-            print(f"Error processing message from {msg.topic}: {e}")
-            import gc
-            gc.collect()
+    except KeyboardInterrupt:
+        print("Message processing interrupted by user")
+    except Exception as e:
+        print(f"Fatal error in message processing: {e}")
+        import gc
+        gc.collect()
+    finally:
+        print("Closing Kafka consumer")
+        consumer.close()
 
 def start_threads(consumer_00: KafkaConsumer,
                   consumer_01: KafkaConsumer):
@@ -98,6 +112,35 @@ def start_threads(consumer_00: KafkaConsumer,
 
     return thread_0, thread_1
 
+def monitor_timeout():
+    """Monitor for timeout and exit if no messages received for timeout_seconds"""
+    global last_message_time, timeout_seconds
+    while True:
+        time.sleep(10)  # Check every 5 seconds
+        current_time = time.time()
+        time_since_last_message = current_time - last_message_time
+        
+        if time_since_last_message > timeout_seconds:
+            print(f"[TIMEOUT] No messages received for {timeout_seconds} seconds. Signaling exit...")
+            # Set a global flag instead of force exit to allow cleanup
+            global should_exit
+            should_exit = True
+            return
+        elif time_since_last_message > timeout_seconds * 0.7:  # Warning at 70% of timeout
+            print(f"[WARNING] No messages for {time_since_last_message:.1f} seconds (timeout in {timeout_seconds - time_since_last_message:.1f}s)")
+            time.sleep(5)  # Sleep to avoid spamming warnings
+
+def calculate_camera_fps(camera_name):
+    """Calculate the output FPS to maintain same duration as original video"""
+    global camera_frame_times, camera_frame_counts
+    
+    # Since producer sends every 5th frame from 30 FPS original
+    # Output should be 30/5 = 6 FPS to maintain same duration
+    output_fps = 6.0
+    
+    print(f"[FPS] Camera {camera_name}: Output video will be {output_fps} FPS (maintains original duration)")
+    return output_fps
+
 def save_processed_videos(processed_images, save_dir):
     """
     Save processed frames from the queue to video files, one per camera.
@@ -105,14 +148,26 @@ def save_processed_videos(processed_images, save_dir):
         processed_images: Queue containing (consumer_name, frame) tuples.
         save_dir: Directory to save videos.
     """
+    global should_exit
+    
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
     writers = {}
     frame_sizes = {}
     print("Saving processed videos. Press Ctrl+C to stop and save.")
+    
+    # # Start timeout monitor thread
+    # timeout_thread = threading.Thread(target=monitor_timeout)
+    # timeout_thread.daemon = True
+    # timeout_thread.start()
+    
     try:
-        while True:
-            consumer_name, frame = processed_images.get()
+        while not should_exit:
+            try:
+                consumer_name, frame = processed_images.get()  # 1 second timeout
+            except:
+                continue  # Continue checking for timeout and should_exit flag
+                
             if frame is None:
                 print(f"Received None image from {consumer_name}, skipping...")
                 continue
@@ -120,27 +175,87 @@ def save_processed_videos(processed_images, save_dir):
                 h, w = frame.shape[:2]
                 output_path = os.path.join(save_dir, f"{consumer_name}.mp4")
                 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                writers[consumer_name] = cv2.VideoWriter(output_path, fourcc, 6, (w, h))
+                
+                # Calculate dynamic FPS based on actual processing rate
+                dynamic_fps = calculate_camera_fps(consumer_name)
+                
+                writers[consumer_name] = cv2.VideoWriter(output_path, fourcc, dynamic_fps, (w, h))
                 frame_sizes[consumer_name] = (w, h)
-                print(f"Started writing video for {consumer_name} to {output_path}")
+                print(f"Started writing video for {consumer_name} to {output_path} at {dynamic_fps:.2f} FPS")
             # Resize if needed
             w, h = frame_sizes[consumer_name]
             if (frame.shape[1], frame.shape[0]) != (w, h):
                 frame = cv2.resize(frame, (w, h))
             writers[consumer_name].write(frame)
             print(f"Processed frame from {consumer_name}, size: {frame.shape}")
+            
+        # Process any remaining frames in queue before finalizing
+        print("[FINALIZING] Processing remaining frames before exit...")
+        remaining_frames = 0
+        while not processed_images.empty():
+            try:
+                consumer_name, frame = processed_images.get_nowait()
+                if frame is not None:
+                    if consumer_name in writers:
+                        w, h = frame_sizes[consumer_name]
+                        if (frame.shape[1], frame.shape[0]) != (w, h):
+                            frame = cv2.resize(frame, (w, h))
+                        writers[consumer_name].write(frame)
+                        remaining_frames += 1
+            except:
+                break
+        
+        if remaining_frames > 0:
+            print(f"[FINALIZING] Processed {remaining_frames} remaining frames")
+            
     except KeyboardInterrupt:
         print("Interrupted. Finalizing video files...")
+        # Process any remaining frames even on interrupt
+        remaining_frames = 0
+        while not processed_images.empty():
+            try:
+                consumer_name, frame = processed_images.get_nowait()
+                if frame is not None and consumer_name in writers:
+                    w, h = frame_sizes[consumer_name]
+                    if (frame.shape[1], frame.shape[0]) != (w, h):
+                        frame = cv2.resize(frame, (w, h))
+                    writers[consumer_name].write(frame)
+                    remaining_frames += 1
+            except:
+                break
+        if remaining_frames > 0:
+            print(f"[FINALIZING] Processed {remaining_frames} remaining frames from interrupt")
+            
     finally:
-        for writer in writers.values():
-            writer.release()
-        print("All videos saved.")
+        # Properly release all video writers
+        print("[FINALIZING] Releasing video writers...")
+        for camera_name, writer in writers.items():
+            if writer is not None:
+                writer.release()
+                print(f"[FINALIZING] Released writer for {camera_name}")
+        print("All videos saved and finalized.")
+        
+        # Force exit after cleanup
+        if should_exit:
+            print("[EXIT] Timeout reached. Exiting application...")
+            os._exit(0)
 
 def display_images():
     """Display the processed images in the main thread"""
-    while True:
-        # Get the next processed image and display it
-        consumer_name, final_img = processed_images.get()
+    global should_exit
+    
+    # Start timeout monitor thread
+    timeout_thread = threading.Thread(target=monitor_timeout)
+    timeout_thread.daemon = True
+    timeout_thread.start()
+    
+    while not should_exit:
+        try:
+            # Get the next processed image and display it
+            consumer_name, final_img = processed_images.get(timeout=1)  # 1 second timeout
+        except:
+            continue  # Continue checking for timeout and should_exit flag
+            
         if final_img is None:
             print(f"Received None image from {consumer_name}, skipping...")
             continue
@@ -151,6 +266,11 @@ def display_images():
         # Press Q on keyboard to exit
         if cv2.waitKey(25) & 0xFF == ord('q'):
             break
+            
+    if should_exit:
+        print("[EXIT] Timeout reached. Closing display windows...")
+        cv2.destroyAllWindows()
+        os._exit(0)
 
 def ensure_kafka_topic(topic_name, bootstrap_servers):
     """Check if a Kafka topic exists, and create it if not."""
