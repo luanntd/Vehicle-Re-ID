@@ -22,19 +22,24 @@ def start_spark():
 
     findspark.init()
 
-    def spark_streaming_thread():
-        detector = VehicleDetector(model_path='best_20.pt')
-        descriptor = VehicleDescriptor(model_type='osnet')
-        vehicle_pipeline= Pipeline(detector=detector, descriptor=descriptor)
+    # Initialize the shared pipeline ONCE at startup (before Spark session)
+    print("[Startup] Initializing shared pipeline for all cameras")
+    detector = VehicleDetector(model_path='best_20.pt')
+    descriptor = VehicleDescriptor(model_type='osnet')
+    shared_pipeline = Pipeline(detector=detector, descriptor=descriptor)
+    print("[Startup] Shared pipeline initialized successfully")
 
-        # Initialize Spark session
+    def spark_streaming_thread():
+        # Initialize Spark session first
         spark = SparkSession.builder \
             .master('local') \
             .appName("vehicle-reid") \
             .config("spark.jars.packages", ",".join(packages)) \
+            .config("spark.sql.adaptive.enabled", "false") \
+            .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer") \
             .getOrCreate()
 
-        spark.conf.set("spark.sql.shuffle.partitions", "20")
+        spark.conf.set("spark.sql.shuffle.partitions", "1")  # Use single partition for shared state
 
         # Define Kafka parameters
         kafka_params = {
@@ -52,27 +57,28 @@ def start_spark():
         df = df.withColumn("value", df["value"].cast(BinaryType()))
 
         @udf(BinaryType())
-        def process_frame(value, tag):
-            print("[UDF] process_frame called")
+        def process_frame(value, topic):
+            """Process individual frames using the shared pipeline."""
+            print(f"[UDF] Processing frame from {topic} using shared pipeline")
             try:
                 # Decode bytes to OpenCV frame
                 frame_buffer = np.frombuffer(value, dtype=np.uint8)
                 frame = cv2.imdecode(frame_buffer, cv2.IMREAD_COLOR)
                 
                 if frame is None:
-                    print("[UDF] ERROR: Could not decode frame")
+                    print(f"[UDF] ERROR: Could not decode frame from {topic}")
                     return value  # Return original bytes if decoding fails
                 
-                print(f"[UDF] Frame decoded successfully: {frame.shape}")
+                print(f"[UDF] Frame decoded successfully: {frame.shape} from {topic}")
                 
-                # Process frame directly (no encoding/decoding)
-                processed_frame = vehicle_pipeline.process(frame, tag)
+                # Process frame with SHARED PIPELINE (same instance for all topics)
+                processed_frame = shared_pipeline.process(frame, topic)
                 
                 # Encode result back to bytes for Kafka
                 _, buffer = cv2.imencode('.jpg', processed_frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
                 result_bytes = buffer.tobytes()
                 
-                print("[UDF] vehicle_pipeline.process finished")
+                print(f"[UDF] Processing completed for {topic}")
                 
                 # Clean up memory
                 del frame_buffer, frame, processed_frame, buffer
@@ -80,15 +86,15 @@ def start_spark():
                 return result_bytes
                 
             except Exception as e:
-                print(f"[UDF] ERROR in process_frame: {e}")
+                print(f"[UDF] ERROR processing frame from {topic}: {e}")
                 import gc
                 gc.collect()
                 return value  # Return original bytes on error
 
-        # Process frames
+        # Process frames using UDF (now with shared pipeline from outer scope)
         processed_df = df \
-            .selectExpr("CAST(key AS STRING)",
-                       "CAST(topic as STRING)",
+            .selectExpr("CAST(key AS STRING) as key",
+                       "CAST(topic as STRING) as topic",
                        "value") \
             .withColumn("value", process_frame("value", "topic"))
 
@@ -96,26 +102,32 @@ def start_spark():
         write_params = [
             {
                 "kafka.bootstrap.servers": "localhost:9092",
-                "topic": kafka_params["subscribe"].split(", ")[i] + "_processed"
-            } for i in range(2)
+                "topic": "cam1_processed"
+            },
+            {
+                "kafka.bootstrap.servers": "localhost:9092", 
+                "topic": "cam2_processed"
+            }
         ]
 
         # Write processed frames back to Kafka
         query_topic1 = processed_df \
             .filter("topic = 'cam1'") \
+            .select("key", "value") \
             .writeStream \
             .format("kafka") \
             .options(**write_params[0]) \
-            .option("checkpointLocation", "tmp/" + write_params[0]["topic"]) \
+            .option("checkpointLocation", "tmp/cam1_processed") \
             .outputMode("append") \
             .start()
 
         query_topic2 = processed_df \
             .filter("topic = 'cam2'") \
+            .select("key", "value") \
             .writeStream \
             .format("kafka") \
             .options(**write_params[1]) \
-            .option("checkpointLocation", "tmp/" + write_params[1]["topic"]) \
+            .option("checkpointLocation", "tmp/cam2_processed") \
             .outputMode("append") \
             .start()
 

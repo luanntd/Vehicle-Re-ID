@@ -42,13 +42,13 @@ def test_reid(model, loader, args):
     all_camera_ids = np.array(all_camera_ids)
 
     # Test with cosine similarity (primary method)
-    mAP_cos, cmc_cos = compute_cmc_map(all_features, all_labels, all_camera_ids, ranks=[1, 5, 10], use_cosine=True)
+    mAP_cos, cmc_cos = compute_cmc_map(all_features, all_labels, all_camera_ids, ranks=[1, 3, 5], use_cosine=True)
     print(f"Cosine Similarity - mAP: {mAP_cos:.4f}")
     for rank, score in cmc_cos.items():
         print(f"Cosine Similarity - {rank}: {score:.4f}")
     
     # Test with Euclidean distance for comparison
-    mAP_eucl, cmc_eucl = compute_cmc_map(all_features, all_labels, all_camera_ids, ranks=[1, 5, 10], use_cosine=False)
+    mAP_eucl, cmc_eucl = compute_cmc_map(all_features, all_labels, all_camera_ids, ranks=[1, 3, 5], use_cosine=False)
     print(f"Euclidean Distance - mAP: {mAP_eucl:.4f}")
     for rank, score in cmc_eucl.items():
         print(f"Euclidean Distance - {rank}: {score:.4f}")
