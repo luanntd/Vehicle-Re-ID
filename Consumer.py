@@ -134,11 +134,10 @@ def calculate_camera_fps(camera_name):
     """Calculate the output FPS to maintain same duration as original video"""
     global camera_frame_times, camera_frame_counts
     
-    # Since producer sends every 5th frame from 30 FPS original
-    # Output should be 30/5 = 6 FPS to maintain same duration
+    # Fixed 6 FPS output as requested
     output_fps = 6.0
     
-    print(f"[FPS] Camera {camera_name}: Output video will be {output_fps} FPS (maintains original duration)")
+    print(f"[FPS] Camera {camera_name}: Output video will be {output_fps} FPS")
     return output_fps
 
 def save_processed_videos(processed_images, save_dir):
