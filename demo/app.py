@@ -89,15 +89,15 @@ websocket_connections: Dict[str, WebSocket] = {}
 # Build paths relative to the script's location
 BASE_DIR = Path(__file__).resolve().parent
 
-# # Create necessary directories
+# Create necessary directories
 (BASE_DIR / "uploads").mkdir(exist_ok=True)
-# (BASE_DIR.parent / "matching").mkdir(exist_ok=True)
-# (BASE_DIR / "static").mkdir(exist_ok=True)
+(BASE_DIR.parent / "matching").mkdir(exist_ok=True)
+(BASE_DIR / "static").mkdir(exist_ok=True)
 (BASE_DIR / "templates").mkdir(exist_ok=True)
 
 # Mount static files
-# app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
-# app.mount("/matching", StaticFiles(directory=BASE_DIR.parent / "matching"), name="matching")
+app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
+app.mount("/matching", StaticFiles(directory=BASE_DIR.parent / "matching"), name="matching")
 
 class ConnectionManager:
     def __init__(self):
@@ -131,25 +131,97 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 async def process_websocket_queue():
-    """Process messages from the global queue and send them to the correct WebSocket."""
+    """Process messages from the global queue and send them to the correct WebSocket.
+    Optimized for memory efficiency and to handle queue backlog situations."""
     print("[WebSocket Processor] Starting...")
     loop = asyncio.get_running_loop()
+    
+    # Track processing statistics
+    processed_count = 0
+    last_stats_time = time.time()
+    stats_interval = 60  # Report stats every minute
+    
     while True:
         try:
-            # Get message from the queue without blocking the event loop
-            session_id, message = await loop.run_in_executor(
-                None, websocket_queue.get
-            )
+            # Get current queue size for monitoring
+            queue_size = websocket_queue.qsize()
             
-            if session_id in manager.active_connections:
-                await manager.send_personal_message(json.dumps(message), session_id)
-            else:
-                print(f"[WebSocket Processor] WebSocket for session {session_id} not found. Discarding message.")
+            # Handle backlog situation - drop old frames if queue gets too big
+            if queue_size > 180:  # If more than 30 frames are queued (5 seconds at 6 FPS)
+                print(f"[WebSocket Processor] WARNING: Queue backlog detected ({queue_size} items). Clearing old frames...")
+                # Keep only the most recent 5 frames for each session
+                session_frames = {}
+                discarded = 0
+                
+                # Process all items in the queue
+                while not websocket_queue.empty():
+                    try:
+                        session_id, message = websocket_queue.get_nowait()
+                        if message.get("type") == "frame":
+                            # Keep only most recent frames per session/camera
+                            key = f"{session_id}_{message.get('camera', 'unknown')}"
+                            if key not in session_frames:
+                                session_frames[key] = []
+                            session_frames[key].append((session_id, message))
+                            websocket_queue.task_done()
+                            discarded += 1
+                        else:
+                            # Re-add non-frame messages
+                            websocket_queue.put((session_id, message))
+                            websocket_queue.task_done()
+                    except Exception:
+                        break
+                
+                # Re-add only the 2 most recent frames per session/camera
+                for key, frames in session_frames.items():
+                    # Sort by frame count if available
+                    frames.sort(key=lambda x: x[1].get("frame_count", 0), reverse=True)
+                    # Add back the 2 most recent frames
+                    for i, (session_id, message) in enumerate(frames[:2]):
+                        websocket_queue.put((session_id, message))
+                
+                print(f"[WebSocket Processor] Cleared queue backlog. Discarded {discarded} items, kept {sum(len(frames[:2]) for frames in session_frames.values())}.")
             
-            # This is for queue.join(), which we are not using, but it's good practice
-            websocket_queue.task_done()
+            # Normal processing - get message from the queue
+            try:
+                # Use a timeout to prevent blocking indefinitely
+                session_id, message = await loop.run_in_executor(
+                    None, lambda: websocket_queue.get(timeout=0.5)
+                )
+                
+                # Send the message if the connection is still active
+                if session_id in manager.active_connections:
+                    # Convert to JSON string once
+                    message_json = json.dumps(message)
+                    await manager.send_personal_message(message_json, session_id)
+                    processed_count += 1
+                else:
+                    # Connection not active, silently discard
+                    pass
+                
+                # Mark as done
+                websocket_queue.task_done()
+                
+                # Free memory
+                del message
+                
+            except asyncio.CancelledError:
+                # Task was cancelled, exit gracefully
+                print("[WebSocket Processor] Task cancelled, shutting down...")
+                return
+            except Exception as e:
+                # Could be queue.Empty or other exception
+                await asyncio.sleep(0.1)  # Short sleep if no messages
+            
+            # Print stats periodically
+            current_time = time.time()
+            if current_time - last_stats_time >= stats_interval:
+                print(f"[WebSocket Processor] Stats: Processed {processed_count} messages in the last {stats_interval} seconds")
+                last_stats_time = current_time
+                processed_count = 0
+                
         except Exception as e:
-            print(f"[WebSocket Processor] Error: {e}")
+            print(f"[WebSocket Processor] Error in main loop: {e}")
             # In case of an error, sleep a bit before retrying
             await asyncio.sleep(1)
 
@@ -167,13 +239,18 @@ def kafka_consumer_thread(session_id: str, camera: str):
             value_deserializer=None,
             key_deserializer=None,
             fetch_max_bytes=52428800,       # 50MB
-            max_in_flight_requests_per_connection=10,
-            fetch_max_wait_ms=100,          # Reduced from 5000ms for real-time
-            fetch_min_bytes=1,              # Don't wait for more data
-            consumer_timeout_ms=1000,       # Reduced timeout
+            max_in_flight_requests_per_connection=5,  # Reduced from 10
+            fetch_max_wait_ms=500,          # Further reduced for responsiveness
+            fetch_min_bytes=1,              
+            consumer_timeout_ms=2000,       # Increased timeout
             auto_offset_reset='latest',
             enable_auto_commit=True,
+            auto_commit_interval_ms=1000,   # Auto-commit every second
             receive_buffer_bytes=67108864,  # 64MB
+            session_timeout_ms=30000,       # Increased session timeout
+            heartbeat_interval_ms=3000,     # Heartbeat every 3 seconds
+            max_poll_records=10,            # Limit records per poll
+            max_poll_interval_ms=300000,    # 5 minutes max poll interval
             group_id=f'demo_consumer_{camera}_{session_id}_{int(time.time())}'
         )
         
@@ -182,75 +259,62 @@ def kafka_consumer_thread(session_id: str, camera: str):
         frame_counter = 0
         last_frame_time = time.time()
         target_fps = 6.0
-        frame_interval = 1.0 / target_fps  # 1/6 = 0.167 seconds between frames
+        frame_interval = 1.0 / target_fps
         print(f"[Kafka Consumer {camera.upper()}] Starting to consume messages at {target_fps} FPS...")
         
-        # Reduce timeout handling to allow smoother streaming
+        # Improved timeout handling
         consecutive_timeouts = 0
-        max_consecutive_timeouts = 10000  # Increased from 300
+        max_consecutive_timeouts = 100  # Reduced from 10000
         
         while consecutive_timeouts < max_consecutive_timeouts:
             try:
-                # Get message with shorter timeout for real-time
-                message_batch = consumer.poll(timeout_ms=100)
+                # Check if session is still active first
+                if session_id not in active_sessions:
+                    print(f"[Kafka Consumer {camera.upper()}] Session {session_id} no longer active, stopping consumer")
+                    break
+                
+                # Get message with better timeout handling
+                message_batch = consumer.poll(timeout_ms=2000)  # Increased timeout
                 
                 if not message_batch:
                     consecutive_timeouts += 1
-                    # Reduce sleep time and less frequent logging for smoother operation
-                    if consecutive_timeouts % 500 == 0:  # Log every 500 timeouts
+                    if consecutive_timeouts % 10 == 0:  # Log every 10 timeouts
                         print(f"[Kafka Consumer {camera.upper()}] No messages received (timeout {consecutive_timeouts}/{max_consecutive_timeouts})")
-                    time.sleep(0.01)  # Very short sleep (10ms)
+                    time.sleep(0.1)  # Slightly longer sleep
                     continue
                 
                 # Reset timeout counter on successful message
                 consecutive_timeouts = 0
                 
-                # Process all messages in the batch
+                # Process messages with frame rate control
                 for topic_partition, messages in message_batch.items():
                     for message in messages:
-                        # Check if session is still active
-                        if session_id not in active_sessions:
-                            print(f"[Kafka Consumer {camera.upper()}] Session {session_id} no longer active, stopping consumer")
-                            return
+                        # Frame rate control
+                        current_time = time.time()
+                        if current_time - last_frame_time < frame_interval:
+                            continue  # Skip this frame to maintain target FPS
                         
-                        # Frame rate control - only process if enough time has passed
-                        # current_time = time.time()
-                        # if current_time - last_frame_time < frame_interval:
-                        #     continue  # Skip this frame to maintain 6 FPS
-                        
-                        # last_frame_time = current_time
+                        last_frame_time = current_time
                         
                         try:
                             # Decode the frame
                             frame_data = message.value
                             
-                            # Only log every 50th frame to reduce console spam
-                            if frame_counter % 50 == 0:
-                                print(f"[Kafka Consumer {camera.upper()}] Received message, data size: {len(frame_data)} bytes")
+                            # Only log every 100th frame to reduce console spam
+                            if frame_counter % 100 == 0:
+                                print(f"[Kafka Consumer {camera.upper()}] Processing frame {frame_counter}, data size: {len(frame_data)} bytes")
                             
                             # Decode image from bytes
                             frame_buffer = np.frombuffer(frame_data, dtype=np.uint8)
                             final_img = cv2.imdecode(frame_buffer, cv2.IMREAD_COLOR)
                             
-                            # Check if final_img is None
                             if final_img is None:
                                 print(f"[Kafka Consumer {camera.upper()}] ERROR: Could not decode image, skipping...")
                                 continue
 
-                            # Only log frame details every 50th frame
-                            if frame_counter % 50 == 0:
-                                print(f"[Kafka Consumer {camera.upper()}] Successfully decoded image, frame size: {final_img.shape}")
-                                # Add frame hash for debugging to detect if frames are actually different
-                                frame_hash = hash(final_img.tobytes())
-                                print(f"[Kafka Consumer {camera.upper()}] Frame hash: {frame_hash}")
-                            
                             # Encode frame to JPEG for web transmission
-                            _, buffer = cv2.imencode('.jpg', final_img)
+                            _, buffer = cv2.imencode('.jpg', final_img, [cv2.IMWRITE_JPEG_QUALITY, 80])
                             frame_b64 = base64.b64encode(buffer).decode('utf-8')
-                            
-                            # Only log websocket details every 50th frame
-                            if frame_counter % 50 == 0:
-                                print(f"[Kafka Consumer {camera.upper()}] Sending frame to WebSocket, base64 length: {len(frame_b64)}")
                             
                             # Create the message dictionary
                             websocket_message = {
@@ -258,50 +322,42 @@ def kafka_consumer_thread(session_id: str, camera: str):
                                 "camera": camera,
                                 "data": frame_b64,
                                 "timestamp": datetime.now().isoformat(),
-                                "frame_count": frame_counter + 1,
-                                "frame_hash": str(hash(final_img.tobytes()))[:8] if frame_counter % 50 == 0 else "hash"
+                                "frame_count": frame_counter + 1
                             }
                             
                             # Send to WebSocket via the main event loop
                             websocket_queue.put((session_id, websocket_message))
                             
-                            # Only log queuing every 50th frame
-                            if frame_counter % 50 == 0:
-                                print(f"[Kafka Consumer {camera.upper()}] Frame queued for WebSocket.")
-                            
-                            # Clean up memory
-                            del frame_buffer, buffer, frame_b64
+                            # Clean up memory immediately
+                            del frame_buffer, final_img, buffer, frame_b64
                             frame_counter += 1
                             
-                            # Much less frequent garbage collection to avoid stuttering
-                            if frame_counter % 2000 == 0:  # Every 2000 frames instead of 500
+                            # More frequent garbage collection
+                            if frame_counter % 50 == 0:
                                 import gc
                                 gc.collect()
-                                print(f"[Kafka Consumer {camera.upper()}] Processed {frame_counter} frames, memory cleaned")
                                 
                         except Exception as e:
                             print(f"[Kafka Consumer {camera.upper()}] Error processing message: {e}")
-                            import traceback
-                            traceback.print_exc()
                             continue
                             
             except Exception as e:
                 print(f"[Kafka Consumer {camera.upper()}] Error in consumer loop: {e}")
-                import traceback
-                traceback.print_exc()
                 consecutive_timeouts += 1
-                if consecutive_timeouts >= max_consecutive_timeouts:
-                    break
+                time.sleep(1)  # Wait before retrying
                     
-        print(f"[Kafka Consumer {camera.upper()}] Consumer loop ended (max timeouts reached or error)")
+        print(f"[Kafka Consumer {camera.upper()}] Consumer loop ended")
                 
     except Exception as e:
         print(f"[Kafka Consumer {camera.upper()}] Error in consumer thread: {e}")
         import traceback
         traceback.print_exc()
     finally:
-        consumer.close()
-        print(f"[Kafka Consumer {camera.upper()}] Consumer closed for session {session_id}")
+        try:
+            consumer.close()
+            print(f"[Kafka Consumer {camera.upper()}] Consumer closed for session {session_id}")
+        except:
+            pass
 
 def matching_monitor_thread(session_id: str):
     """Thread function to monitor matching folder for new vehicle matches"""
@@ -464,25 +520,25 @@ async def start_processing(session_id: str):
         
         # Wait for Spark to initialize
         print(f"[Processing] Waiting for Spark to initialize...")
-        await asyncio.sleep(20)  # Reduced from 60 to 10 seconds
+        await asyncio.sleep(30)  # Increased to 30 seconds to ensure Spark is ready
         
         # Start video producers
         print(f"[Processing] Starting video producers for session {session_id}")
         
-        # Start cam1 producer
+        # Start cam1 producer with controlled frame rate
         producer1 = VideoProducer(
             video_path=session_data["cameras"]["cam1"],
             topic_name=f"cam1_{session_id}",
             bootstrap_servers="localhost:9092",
-             fps=6.0  # Set to 6 FPS for real-time streaming
+            fps=6.0  # Set to 6 FPS for controlled streaming
         )
         
-        # Start cam2 producer
+        # Start cam2 producer with controlled frame rate
         producer2 = VideoProducer(
             video_path=session_data["cameras"]["cam2"],
             topic_name=f"cam2_{session_id}",
             bootstrap_servers="localhost:9092",
-            fps=6.0  # Set to 6 FPS for real-time streaming
+            fps=6.0  # Set to 6 FPS for controlled streaming
         )
         
         # Start producers in threads
@@ -510,11 +566,17 @@ async def start_processing(session_id: str):
         matching_thread.start()
         session_data["matching_thread"] = matching_thread
         
+        # Update session status
         session_data["status"] = "processing"
+        session_data["processing_start_time"] = datetime.now().isoformat()
         
         print(f"[Processing] Started processing for session {session_id}")
         
-        return {"message": "Processing started", "session_id": session_id}
+        return {
+            "message": "Processing started", 
+            "session_id": session_id,
+            "start_time": session_data["processing_start_time"]
+        }
         
     except Exception as e:
         print(f"[Processing] Error starting processing: {e}")
@@ -545,6 +607,24 @@ async def get_session_status(session_id: str):
         raise HTTPException(status_code=404, detail="Session not found")
     
     session_data = active_sessions[session_id]
+    
+    # Get additional status information
+    spark_thread_alive = False
+    kafka_threads_alive = {"cam1": False, "cam2": False}
+    matching_thread_alive = False
+    
+    if session_data["spark_thread"]:
+        spark_thread_alive = session_data["spark_thread"].is_alive()
+        
+    if session_data["kafka_threads"]["cam1"]:
+        kafka_threads_alive["cam1"] = session_data["kafka_threads"]["cam1"].is_alive()
+        
+    if session_data["kafka_threads"]["cam2"]:
+        kafka_threads_alive["cam2"] = session_data["kafka_threads"]["cam2"].is_alive()
+        
+    if session_data["matching_thread"]:
+        matching_thread_alive = session_data["matching_thread"].is_alive()
+    
     return {
         "session_id": session_id,
         "status": session_data["status"],
@@ -552,19 +632,47 @@ async def get_session_status(session_id: str):
         "cameras": {
             "cam1": session_data["cameras"]["cam1"] is not None,
             "cam2": session_data["cameras"]["cam2"] is not None
+        },
+        "threads": {
+            "spark_alive": spark_thread_alive,
+            "kafka_cam1_alive": kafka_threads_alive["cam1"],
+            "kafka_cam2_alive": kafka_threads_alive["cam2"],
+            "matching_alive": matching_thread_alive
+        },
+        "processing_info": {
+            "start_time": session_data.get("processing_start_time", None),
+            "elapsed_time": str(datetime.now() - datetime.fromisoformat(session_data.get("processing_start_time", datetime.now().isoformat()))) if session_data.get("processing_start_time") else "Not started"
         }
     }
 
 @app.websocket("/ws/{session_id}")
 async def websocket_endpoint(websocket: WebSocket, session_id: str):
-    """WebSocket endpoint for real-time frame streaming"""
+    """WebSocket endpoint for real-time frame streaming with heartbeat mechanism"""
     await manager.connect(websocket, session_id)
+    
+    heartbeat_interval = 30  # Send a heartbeat every 30 seconds to keep connection alive
+    last_heartbeat = time.time()
     
     try:
         while True:
-            # Keep the connection alive without waiting for client messages
-            await asyncio.sleep(1)
+            # Use a short sleep to keep the connection responsive
+            await asyncio.sleep(0.5)
+            
+            # Send a lightweight heartbeat message periodically
+            current_time = time.time()
+            if current_time - last_heartbeat >= heartbeat_interval:
+                try:
+                    await websocket.send_json({"type": "heartbeat", "timestamp": datetime.now().isoformat()})
+                    last_heartbeat = current_time
+                except Exception as e:
+                    print(f"[WebSocket] Error sending heartbeat: {e}")
+                    break
+                    
     except WebSocketDisconnect:
+        print(f"[WebSocket] Client disconnected for session {session_id}")
+        manager.disconnect(session_id)
+    except Exception as e:
+        print(f"[WebSocket] Error in WebSocket connection: {e}")
         manager.disconnect(session_id)
         print(f"WebSocket disconnected and removed for session: {session_id}")
 
