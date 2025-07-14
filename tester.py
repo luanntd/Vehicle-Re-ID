@@ -1,19 +1,22 @@
 import os
 import torch
 import numpy as np
+import json
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from tqdm import tqdm
 
 from utils.dataset import VehicleReIDDataset
-from utils.compute_metrics import compute_cmc_map
+from utils.compute_metrics import compute_cmc_map, compute_classification_metrics
 from realtime_reid.feature_extraction import VehicleDescriptor
 
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+
 def test_reid(model, loader, args):
-    """Test feature extraction + similarity ranking"""
+    """Test feature extraction + similarity ranking with comprehensive metrics using cosine similarity
+    """
     print("\n=== Testing Feature Extraction + Similarity Ranking ===")
     
     # Extract features
@@ -41,19 +44,58 @@ def test_reid(model, loader, args):
     all_labels = np.array(all_labels)
     all_camera_ids = np.array(all_camera_ids)
 
-    # Test with cosine similarity (primary method)
-    mAP_cos, cmc_cos = compute_cmc_map(all_features, all_labels, all_camera_ids, ranks=[1, 5, 10], use_cosine=True)
-    print(f"Cosine Similarity - mAP: {mAP_cos:.4f}")
-    for rank, score in cmc_cos.items():
-        print(f"Cosine Similarity - {rank}: {score:.4f}")
+    # Compute Re-ID metrics using cosine similarity
+    mAP, cmc = compute_cmc_map(all_features, all_labels, all_camera_ids, ranks=[1, 3, 5], use_cosine=True)
+    print(f"mAP: {mAP:.4f}")
+    for rank, score in cmc.items():
+        print(f"{rank}: {score:.4f}")
+
+    print(f"\nDataset Statistics:")
+    print(f"Total samples: {len(all_labels)}")
+    print(f"Unique vehicles: {len(np.unique(all_labels))}")
+    print(f"Unique cameras: {len(np.unique(all_camera_ids))}")
+
+    # 2. Classification metrics with different thresholds
+    print("\n=== Classification Metrics ===")
     
-    # Test with Euclidean distance for comparison
-    mAP_eucl, cmc_eucl = compute_cmc_map(all_features, all_labels, all_camera_ids, ranks=[1, 5, 10], use_cosine=False)
-    print(f"Euclidean Distance - mAP: {mAP_eucl:.4f}")
-    for rank, score in cmc_eucl.items():
-        print(f"Euclidean Distance - {rank}: {score:.4f}")
+    thresholds = args.thresholds if hasattr(args, 'thresholds') else [0.5, 0.8]
+    best_f1 = 0
+    best_threshold = 0.5
     
-    return mAP_cos, cmc_cos
+    for threshold in thresholds:
+        # Cosine similarity based metrics
+        cos_metrics = compute_classification_metrics(
+            all_features, all_labels, all_camera_ids, 
+            threshold=threshold
+        )
+        
+        print(f"\nThreshold={threshold}:")
+        print(f"  Top-1 Accuracy: {cos_metrics['top1_accuracy']:.4f}")
+        print(f"  Threshold Accuracy: {cos_metrics['threshold_accuracy']:.4f}")
+        print(f"  Precision: {cos_metrics['precision']:.4f}")
+        print(f"  Recall: {cos_metrics['recall']:.4f}")
+        print(f"  F1-Score: {cos_metrics['f1_score']:.4f}")
+        
+        if cos_metrics['f1_score'] > best_f1:
+            best_f1 = cos_metrics['f1_score']
+            best_threshold = threshold
+
+    print(f"\nBest F1-Score: {best_f1:.4f} at threshold={best_threshold}")
+
+    # Summary
+    print("\n=== Summary ===")
+    print(f"Re-ID Performance:")
+    print(f"  mAP: {mAP:.4f}")
+    print(f"  Rank-1: {cmc['Rank-1']:.4f}")
+    print(f"Classification Performance:")
+    print(f"  Best F1-Score: {best_f1:.4f}")
+    
+    return {
+        'mAP': mAP,
+        'cmc': cmc,
+        'best_f1': best_f1,
+        'best_threshold': best_threshold
+    }
 
 def main():
     import argparse
@@ -62,6 +104,8 @@ def main():
     parser.add_argument('--model_type', type=str, default='osnet', choices=['osnet', 'resnet_ibn', 'efficientnet'], help='Model type')
     parser.add_argument('--model_path', type=str, default='checkpoints/best_osnet_model.pth', help='Path to trained model checkpoint')
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size for testing')
+    parser.add_argument('--save_results', type=str, default=None, help='Path to save detailed results (JSON format)')
+    parser.add_argument('--thresholds', nargs='+', type=float, default=[0.5, 0.8], help='Similarity thresholds for classification metrics')
     args = parser.parse_args()
 
     # Define transforms (same as val)
@@ -110,7 +154,23 @@ def main():
     model.eval()
 
     # Run feature extraction test
-    test_reid(model, loader, args)
+    results = test_reid(model, loader, args)
+    
+    # Save results if requested
+    if args.save_results:
+        import json
+        with open(args.save_results, 'w') as f:
+            # Convert numpy types to Python types for JSON serialization
+            json_results = {}
+            for key, value in results.items():
+                if isinstance(value, dict):
+                    json_results[key] = {k: float(v) if isinstance(v, (np.float32, np.float64)) else v 
+                                        for k, v in value.items()}
+                else:
+                    json_results[key] = float(value) if isinstance(value, (np.float32, np.float64)) else value
+            
+            json.dump(json_results, f, indent=2)
+        print(f"\nResults saved to: {args.save_results}")
 
 if __name__ == "__main__":
     main()

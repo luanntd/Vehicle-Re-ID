@@ -273,26 +273,41 @@ def display_images():
 
 def ensure_kafka_topic(topic_name, bootstrap_servers):
     """Check if a Kafka topic exists, and create it if not."""
-    admin_client = KafkaAdminClient(bootstrap_servers=bootstrap_servers)
-    existing_topics = admin_client.list_topics()
-    if topic_name not in existing_topics:
-        try:
-            admin_client.create_topics([NewTopic(name=topic_name, num_partitions=1, replication_factor=1)])
-            print(f"Created Kafka topic: {topic_name}")
-            return KafkaConsumer(
-                topic_name,
-                bootstrap_servers=[bootstrap_servers],
-            )
-        except Exception as e:
-            print(f"Error creating topic {topic_name}: {e}")
-    else:
-        print(f"Kafka topic already exists: {topic_name}")
+    admin_client = None
+    try:
+        admin_client = KafkaAdminClient(bootstrap_servers=bootstrap_servers)
+        existing_topics = admin_client.list_topics()
+        
+        if topic_name not in existing_topics:
+            try:
+                admin_client.create_topics([NewTopic(name=topic_name, num_partitions=1, replication_factor=1)])
+                print(f"Created Kafka topic: {topic_name}")
+                # Wait a bit for topic to be fully created
+                time.sleep(2)
+            except Exception as e:
+                print(f"Error creating topic {topic_name}: {e}")
+                # Topic might already exist due to race condition, continue anyway
+        else:
+            print(f"Kafka topic already exists: {topic_name}")
+        
         # Return a consumer for the topic
-        return KafkaConsumer(
-                topic_name,
-                bootstrap_servers=[bootstrap_servers],
-            )
-    admin_client.close()
+        consumer = KafkaConsumer(
+            topic_name,
+            bootstrap_servers=[bootstrap_servers],
+            auto_offset_reset='latest',  # Start from latest messages
+            value_deserializer=None,     # We handle bytes manually
+            consumer_timeout_ms=1000     # Timeout for testing if topic exists
+        )
+        
+        print(f"Successfully connected to Kafka topic: {topic_name}")
+        return consumer
+        
+    except Exception as e:
+        print(f"Failed to connect to Kafka topic {topic_name}: {e}")
+        raise e
+    finally:
+        if admin_client:
+            admin_client.close()
 
 def main():
     admin_client = KafkaAdminClient(bootstrap_servers=BOOTSTRAP_SERVERS)
@@ -300,34 +315,57 @@ def main():
     time.sleep(5)  # Wait for a moment to ensure the topics are listed correctly
     admin_client.close()
 
-    # Start Spark streaming
+    # Start Spark streaming with proper error handling
     from streaming.spark_services.spark_streaming import start_spark
-    spark_thread = threading.Thread(target=start_spark)
+    spark_thread = None
     try:
         print("Starting Spark streaming...")
-        spark_thread.start()
+        spark_thread = start_spark()  # start_spark() returns the thread
         print("Spark streaming started.")
-    except KeyboardInterrupt:
-        print("Spark streaming interrupted by user.")
         
-    # Ensure Kafka topics exist
-    consumer_00 = ensure_kafka_topic(TOPIC_1 + "_processed", BOOTSTRAP_SERVERS)
-    if TOPIC_2 and TOPIC_2 != "NULL":
-        consumer_01 = ensure_kafka_topic(TOPIC_2 + "_processed", BOOTSTRAP_SERVERS)
-    else:
-        consumer_01 = None
+        # Wait a bit for Spark to initialize and create output topics
+        print("Waiting for Spark streaming to initialize...")
+        time.sleep(10)
+        
+    except Exception as e:
+        print(f"Error starting Spark streaming: {e}")
+        print("Consumer will exit since Spark streaming failed to start.")
+        return
+        
+    # Ensure Kafka topics exist (topics that Spark creates)
+    processed_topic1 = TOPIC_1 + "_processed"
+    processed_topic2 = TOPIC_2 + "_processed" if TOPIC_2 and TOPIC_2 != "NULL" else None
+    
+    try:
+        consumer_00 = ensure_kafka_topic(processed_topic1, BOOTSTRAP_SERVERS)
+        if processed_topic2:
+            consumer_01 = ensure_kafka_topic(processed_topic2, BOOTSTRAP_SERVERS)
+        else:
+            consumer_01 = None
+    except Exception as e:
+        print(f"Error creating/connecting to Kafka topics: {e}")
+        return
+        
     thread_0, thread_1 = start_threads(consumer_00, consumer_01)
     print("Threads started for processing messages.")
 
-    if args['save_dir']:
-        save_processed_videos(processed_images, args['save_dir'])
-    else:
-        display_images()
-
-    # Wait for both threads to finish
-    thread_0.join()
-    if thread_1 is not None:
-        thread_1.join()
+    try:
+        if args['save_dir']:
+            save_processed_videos(processed_images, args['save_dir'])
+        else:
+            display_images()
+    except KeyboardInterrupt:
+        print("Consumer interrupted by user.")
+    finally:
+        # Clean shutdown
+        print("Shutting down consumer threads...")
+        # Note: In a production system, you'd want to implement proper thread shutdown
+        
+        # Wait for both threads to finish
+        if thread_0.is_alive():
+            thread_0.join(timeout=5)
+        if thread_1 is not None and thread_1.is_alive():
+            thread_1.join(timeout=5)
 
     # Closes all the frames
     cv2.destroyAllWindows()
