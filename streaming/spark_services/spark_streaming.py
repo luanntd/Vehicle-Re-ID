@@ -141,7 +141,7 @@ def start_spark(session_id = None, base_dir = None):
             kafka_params = {
                 "kafka.bootstrap.servers": "localhost:9092",
                 "subscribe": f"cam1_{session_id},cam2_{session_id}" if session_id else "cam1,cam2",
-                # "maxOffsetsPerTrigger": "200",  # Reduced batch size for better performance
+                # "maxOffsetsPerTrigger": "12",  # Reduced batch size for better performance
                 "fetchOffset.numRetries": "3",
                 "fetchOffset.retryIntervalMs": "1000"
             }
