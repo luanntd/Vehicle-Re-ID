@@ -9,10 +9,20 @@ from pyspark.sql import SparkSession
 from pyspark.sql.functions import udf
 from pyspark.sql.types import BinaryType
 from pathlib import Path
+import time
+import traceback
+import shutil
+import os
+import sys
+import gc
+import numpy as np
+import findspark
+import cv2
 from realtime_reid.pipeline import Pipeline
 from realtime_reid.vehicle_detector import VehicleDetector
 from realtime_reid.feature_extraction import VehicleDescriptor
 from realtime_reid.classifier_chromadb import ChromaDBVehicleReID
+import gc
 
 # Global variable to hold the single shared pipeline instance with ChromaDB
 # This will be initialized lazily to avoid serialization
@@ -105,6 +115,9 @@ def start_spark(session_id = None, base_dir = None):
     _shared_pipeline = None
     _current_session_id = None
     
+    # Frame counter for garbage collection
+    frame_counter = 0
+    
     def spark_streaming_thread():
         print(f"[SPARK] Starting Spark streaming thread for session: {session_id}")
         
@@ -112,21 +125,24 @@ def start_spark(session_id = None, base_dir = None):
             # Initialize Spark session first
             print(f"[SPARK] Initializing Spark session...")
             spark = SparkSession.builder \
-                .master('local') \
+                .master('local[2]') \
                 .appName(f"vehicle-reid-chromadb-{session_id}" if session_id else "vehicle-reid-chromadb") \
                 .config("spark.jars.packages", ",".join(packages)) \
                 .config("spark.sql.adaptive.enabled", "false") \
                 .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer") \
                 .config("spark.sql.execution.arrow.pyspark.enabled", "false") \
-                .config("spark.serializer.objectStreamReset", "1") \
+                .config("spark.serializer.objectStreamReset", "100") \
                 .config("spark.rdd.compress", "false") \
                 .config("spark.kryo.unsafe", "true") \
                 .config("spark.kryoserializer.buffer.max", "512m") \
+                .config("spark.sql.streaming.checkpointLocation", f"/tmp/spark-checkpoint-{session_id}") \
+                .config("spark.cleaner.periodicGC.interval", "10s") \
+                .config("spark.cleaner.referenceTracking.blocking", "false") \
                 .getOrCreate()
             
             print(f"[SPARK] Spark session created successfully")
             
-            spark.conf.set("spark.sql.shuffle.partitions", "1")  # Use single partition for shared state
+            spark.conf.set("spark.sql.shuffle.partitions", "2")  # Slightly increase partitions
             
             # Test pipeline creation early
             print(f"[SPARK] Testing pipeline creation...")
@@ -137,13 +153,16 @@ def start_spark(session_id = None, base_dir = None):
                 print(f"[SPARK] ERROR: Pipeline creation failed: {e}")
                 raise
             
-            # Define Kafka parameters
+            # Define Kafka parameters with better settings
             kafka_params = {
                 "kafka.bootstrap.servers": "localhost:9092",
                 "subscribe": f"cam1_{session_id},cam2_{session_id}" if session_id else "cam1,cam2",
-                # "maxOffsetsPerTrigger": "12",  # Reduced batch size for better performance
+                "maxOffsetsPerTrigger": "20",  # Increased batch size
                 "fetchOffset.numRetries": "3",
-                "fetchOffset.retryIntervalMs": "1000"
+                "fetchOffset.retryIntervalMs": "1000",
+                "kafka.session.timeout.ms": "30000",
+                "kafka.request.timeout.ms": "40000",
+                "kafka.max.poll.interval.ms": "300000"
             }
             
             print(f"[SPARK] Kafka parameters: {kafka_params}")
@@ -160,24 +179,19 @@ def start_spark(session_id = None, base_dir = None):
             
             df = df.withColumn("value", df["value"].cast(BinaryType()))
             
-            # print(f"[SPARK] DataFrame schema: {df.schema}")
-            
             # UDF for processing frames with ChromaDB-backed pipeline
             def create_process_frame_udf(session_id, base_dir_str):
+                frame_counter = 0  # Local counter for each UDF instance
+                
                 @udf(BinaryType())
                 def process_frame_with_chromadb(value, topic):
                     """Process individual frames using ChromaDB-backed vehicle ReID pipeline."""
-                    # print(f"[UDF-ChromaDB] Processing frame from {topic} using CHROMADB-BACKED PIPELINE (session: {session_id})")
+                    nonlocal frame_counter
+                    frame_counter += 1
                     
                     try:    
                         # Create pipeline instance inside UDF to avoid serialization issues
-                        try:
-                            pipeline = get_or_create_shared_pipeline(session_id, base_dir_str)
-                        except Exception as e:
-                            print(f"[UDF-ChromaDB] ERROR creating pipeline: {e}")
-                            import traceback
-                            traceback.print_exc()
-                            return value
+                        pipeline = get_or_create_shared_pipeline(session_id, base_dir_str)
                         
                         # Decode bytes to OpenCV frame
                         frame_buffer = np.frombuffer(value, dtype=np.uint8)
@@ -185,32 +199,33 @@ def start_spark(session_id = None, base_dir = None):
                         
                         if frame is None:
                             print(f"[UDF-ChromaDB] ERROR: Could not decode frame from {topic}")
-                            return value  # Return original bytes if decoding fails
+                            return value
                         
-                        print(f"[UDF-ChromaDB] Frame decoded successfully: {frame.shape} from {topic}")
+                        # Only log every 50th frame to reduce console spam
+                        if frame_counter % 50 == 0:
+                            print(f"[UDF-ChromaDB] Processing frame {frame_counter} from {topic}")
                         
                         # Process frame with CHROMADB-BACKED PIPELINE
-                        # This provides persistent vehicle tracking across cameras and sessions
-                        processed_frame = pipeline.process(frame, topic)
+                        processed_frame = pipeline.process(frame, topic[4:])
                         
                         # Encode result back to bytes for Kafka
-                        _, buffer = cv2.imencode('.jpg', processed_frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                        _, buffer = cv2.imencode('.jpg', processed_frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
                         result_bytes = buffer.tobytes()
                         
-                        print(f"[UDF-ChromaDB] Processing completed for {topic} using ChromaDB-backed pipeline")
-                        
-                        # Clean up memory
+                        # Aggressive memory cleanup
                         del frame_buffer, frame, processed_frame, buffer
+                        
+                        # More frequent garbage collection for UDF
+                        if frame_counter % 25 == 0:
+                            gc.collect()
                         
                         return result_bytes
                         
                     except Exception as e:
-                        print(f"[UDE-ChromaDB] ERROR processing frame from {topic}: {e}")
-                        import traceback
-                        traceback.print_exc()
-                        import gc
+                        print(f"[UDF-ChromaDB] ERROR processing frame from {topic}: {e}")
+                        # Force garbage collection on error
                         gc.collect()
-                        return value  # Return original bytes on error
+                        return value
                 
                 return process_frame_with_chromadb
             
@@ -226,38 +241,38 @@ def start_spark(session_id = None, base_dir = None):
                            "value") \
                 .withColumn("value", process_frame_udf("value", "topic"))
 
-            # Define output Kafka parameters with session-specific checkpoints
-            checkpoint_dir_1 = f"tmp/cam1_processed_chromadb_{session_id}" if session_id else "tmp/cam1_processed_chromadb"
-            checkpoint_dir_2 = f"tmp/cam2_processed_chromadb_{session_id}" if session_id else "tmp/cam2_processed_chromadb"
+            # Define a base for checkpoint locations, using the base_dir if available
+            checkpoint_base = Path(base_dir) / "tmp" if base_dir else Path("tmp")
+            checkpoint_base.mkdir(exist_ok=True)
             
-            # Clean up old checkpoint directories if they exist to avoid topic mismatch issues
-            import shutil
-            for checkpoint_dir in [checkpoint_dir_1, checkpoint_dir_2]:
-                if os.path.exists(checkpoint_dir):
+            # Clean up old checkpoint directories
+            checkpoint_dirs = [
+                checkpoint_base / f"cam1_processed_chromadb_{session_id}" if session_id else checkpoint_base / "cam1_processed_chromadb",
+                checkpoint_base / f"cam2_processed_chromadb_{session_id}" if session_id else checkpoint_base / "cam2_processed_chromadb"
+            ]
+            
+            for checkpoint_dir in checkpoint_dirs:
+                if checkpoint_dir.exists():
                     try:
                         shutil.rmtree(checkpoint_dir)
                         print(f"[SPARK-ChromaDB] Cleaned up old checkpoint directory: {checkpoint_dir}")
                     except Exception as e:
                         print(f"[SPARK-ChromaDB] Warning: Could not clean checkpoint dir {checkpoint_dir}: {e}")
-            
-            # Define a base for checkpoint locations, using the base_dir if available
-            checkpoint_base = Path(base_dir) / "tmp" if base_dir else Path("tmp")
-            checkpoint_base.mkdir(exist_ok=True)
 
             write_params = [
                 {
                     "kafka.bootstrap.servers": "localhost:9092",
                     "topic": f"cam1_processed_{session_id}" if session_id else "cam1_processed",
-                    "checkpointLocation": str(checkpoint_base / f"cam1_processed_chromadb_{session_id}" if session_id else "cam1_processed_chromadb"),
+                    "checkpointLocation": str(checkpoint_dirs[0]),
                 },
                 {
                     "kafka.bootstrap.servers": "localhost:9092", 
                     "topic": f"cam2_processed_{session_id}" if session_id else "cam2_processed",
-                    "checkpointLocation": str(checkpoint_base / f"cam2_processed_chromadb_{session_id}" if session_id else "cam2_processed_chromadb"),
+                    "checkpointLocation": str(checkpoint_dirs[1]),
                 }
             ]
             
-            # Write processed frames back to Kafka
+            # Write processed frames back to Kafka with better trigger settings
             print(f"[SPARK] Starting streaming queries...")
             query_topic1 = processed_df \
                 .filter(f"topic = 'cam1_{session_id}'" if session_id else "topic = 'cam1'") \
@@ -266,6 +281,7 @@ def start_spark(session_id = None, base_dir = None):
                 .format("kafka") \
                 .options(**write_params[0]) \
                 .outputMode("append") \
+                .trigger(processingTime="2 seconds") \
                 .start()
 
             query_topic2 = processed_df \
@@ -275,13 +291,65 @@ def start_spark(session_id = None, base_dir = None):
                 .format("kafka") \
                 .options(**write_params[1]) \
                 .outputMode("append") \
+                .trigger(processingTime="2 seconds") \
                 .start()
 
             try:
-                # Wait for both queries to terminate
+                # Wait for both queries to process all data with a timeout mechanism
                 print("[SPARK-ChromaDB] Starting vehicle ReID streaming with ChromaDB backend...")
-                query_topic1.awaitTermination()
-                query_topic2.awaitTermination()
+                
+                # Keep track of last activity time
+                last_active_time = time.time()
+                idle_timeout = 300  # 5 minutes idle timeout before considering processing complete
+                activity_check_interval = 30  # Check for activity every 30 seconds
+                
+                # Create a flag accessible to the main thread to signal termination
+                global_shutdown = [False]
+                
+                # Set up a shutdown hook for clean termination from outside
+                def shutdown_hook():
+                    global_shutdown[0] = True
+                    
+                # Track progress and detect when processing is complete
+                while not global_shutdown[0]:
+                    # Check if queries are active
+                    recent_progress1 = query_topic1.recentProgress
+                    recent_progress2 = query_topic2.recentProgress
+                    
+                    has_activity = False
+                    
+                    # Log status every 30 seconds
+                    print(f"[SPARK-ChromaDB] Status: Query 1 progress entries: {len(recent_progress1)}, Query 2 progress entries: {len(recent_progress2)}")
+                    
+                    # Check for input rows processed in recent batches
+                    if recent_progress1 and any(p.get("numInputRows", 0) > 0 for p in recent_progress1):
+                        print(f"[SPARK-ChromaDB] Query 1 active - processing data")
+                        has_activity = True
+                        last_active_time = time.time()
+                        
+                    if recent_progress2 and any(p.get("numInputRows", 0) > 0 for p in recent_progress2):
+                        print(f"[SPARK-ChromaDB] Query 2 active - processing data")
+                        has_activity = True
+                        last_active_time = time.time()
+                    
+                    # If no activity for a while, check if we should shutdown
+                    if not has_activity:
+                        idle_time = time.time() - last_active_time
+                        print(f"[SPARK-ChromaDB] No activity detected for {idle_time:.1f} seconds")
+                        
+                        if idle_time > idle_timeout:
+                            print(f"[SPARK-ChromaDB] Idle timeout reached ({idle_timeout}s). Assuming processing is complete.")
+                            break
+                    
+                    # Sleep before next check
+                    time.sleep(activity_check_interval)
+                
+                # Stop queries gracefully
+                print("[SPARK-ChromaDB] Stopping streaming queries...")
+                query_topic1.stop()
+                query_topic2.stop()
+                print("[SPARK-ChromaDB] All streaming queries stopped")
+                
             except KeyboardInterrupt:
                 print("[SPARK-ChromaDB] KeyboardInterrupt received, stopping queries...")
                 query_topic1.stop()

@@ -60,11 +60,11 @@ class VideoProducer:
                 bootstrap_servers=self.bootstrap_servers,
                 max_request_size=10485760,  # 10MB
                 buffer_memory=67108864,     # 64MB
-                max_in_flight_requests_per_connection=1,
-                batch_size=1,               # Send immediately
-                linger_ms=0,                # No batching delay
+                max_in_flight_requests_per_connection=5,  # Reduced from 1
+                batch_size=16384,           # Increased batch size (16KB)
+                linger_ms=10,               # Small batching delay (10ms)
                 acks=1,                     # Wait for one broker to acknowledge
-                compression_type=None,      # No compression for real-time
+                compression_type='gzip',  # Add compression
                 value_serializer=None,
                 key_serializer=None,
             )
@@ -109,10 +109,25 @@ class VideoProducer:
             progress_bar.close()
             video.release()
             
-            # Loop the video by restarting
+            # Signal completion but wait before exiting to allow processing to complete
             if self.is_streaming:
-                print(f"[Producer] Looping video for {self.topic_name}")
-                self.start_streaming()
+                print(f"[Producer] Completed streaming all frames for {self.topic_name}")
+                
+                # Send a final marker message to indicate end of stream
+                try:
+                    self.producer.send(
+                        self.topic_name,
+                        key=b"END_OF_STREAM",
+                        value=b"END_OF_STREAM"
+                    )
+                    self.producer.flush()
+                    print(f"[Producer] End-of-stream marker sent for {self.topic_name}")
+                    
+                    # Wait a bit to ensure all messages are processed
+                    time.sleep(10)
+                    print(f"[Producer] Stream {self.topic_name} fully completed")
+                except Exception as e:
+                    print(f"[Producer] Error sending end-of-stream marker: {e}")
             
         except Exception as e:
             print(f"[Producer] Error in streaming: {e}")
