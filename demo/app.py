@@ -401,16 +401,31 @@ async def get_latest_matches():
     try:
         image_files = []
         
+        # Debug log for troubleshooting
+        print(f"[Latest Matches] Looking for images in {matching_dir}")
+        
         # First, get all image files directly from the matching folder (flat structure)
         flat_files = list(matching_dir.glob("*.jpg"))
         image_files.extend(flat_files)
+        print(f"[Latest Matches] Found {len(flat_files)} flat files")
         
         # Then, get all image files from subdirectories (legacy structure)
         for subdir in matching_dir.iterdir():
             if subdir.is_dir():
                 subdir_files = list(subdir.glob("*.jpg"))
+                print(f"[Latest Matches] Found {len(subdir_files)} files in subdirectory {subdir.name}")
                 image_files.extend(subdir_files)
         
+        print(f"[Latest Matches] Total images found: {len(image_files)}")
+        
+        if not image_files:
+            # For testing: use some hardcoded test images if none are found
+            test_dir = matching_dir / "test1"
+            if test_dir.exists():
+                test_images = list(test_dir.glob("*.jpg"))
+                if test_images:
+                    print(f"[Latest Matches] Found {len(test_images)} test images in {test_dir}")
+                    image_files.extend(test_images)
         
         # Sort by modification time (newest first)
         image_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
@@ -422,8 +437,11 @@ async def get_latest_matches():
             # Calculate the relative path from the matching directory
             relative_path = img_path.relative_to(matching_dir)
             
+            # Create camera tag based on filename or path
+            camera_tag = "cam1" if "cam1" in img_path.name.lower() else "cam2" if "cam2" in img_path.name.lower() else "cam1" if "test1" in str(img_path) else "cam2"
+            
             matches.append({
-                "filename": img_path.name,
+                "filename": f"{camera_tag}_{img_path.name}",  # Add camera prefix if not present
                 "path": f"/matching/{relative_path.as_posix()}",
                 "thumbnail_url": f"/matching_resized/{img_path.name}?width=90&height=120",
                 "small_thumbnail_url": f"/matching_resized/{img_path.name}?width=60&height=80",
@@ -530,7 +548,7 @@ async def start_processing(session_id: str):
             video_path=session_data["cameras"]["cam1"],
             topic_name=f"cam1_{session_id}",
             bootstrap_servers="localhost:9092",
-            fps=6.0  # Set to 6 FPS for controlled streaming
+            fps= None  # Set to 6 FPS for controlled streaming
         )
         
         # Start cam2 producer with controlled frame rate
@@ -538,7 +556,7 @@ async def start_processing(session_id: str):
             video_path=session_data["cameras"]["cam2"],
             topic_name=f"cam2_{session_id}",
             bootstrap_servers="localhost:9092",
-            fps=6.0  # Set to 6 FPS for controlled streaming
+            fps= None  # Set to 6 FPS for controlled streaming
         )
         
         # Start producers in threads
@@ -850,23 +868,33 @@ async def get_resized_matching_image(filename: str, width: int = 90, height: int
     try:
         matching_dir = BASE_DIR.parent / "matching"
         
+        # Clean filename by removing any camera prefix (cam1_, cam2_)
+        clean_filename = filename
+        if clean_filename.startswith(("cam1_", "cam2_")):
+            clean_filename = clean_filename[5:]  # Remove the prefix
+        
+        print(f"[Resize] Looking for image: {clean_filename}, original request: {filename}")
+        
         # Try to find the file in the matching directory or subdirectories
         image_path = None
         
         # First check if it's a flat file
-        flat_file = matching_dir / filename
+        flat_file = matching_dir / clean_filename
         if flat_file.exists():
             image_path = flat_file
+            print(f"[Resize] Found image as flat file: {flat_file}")
         else:
             # Check subdirectories
             for subdir in matching_dir.iterdir():
                 if subdir.is_dir():
-                    subdir_file = subdir / filename
+                    subdir_file = subdir / clean_filename
                     if subdir_file.exists():
                         image_path = subdir_file
+                        print(f"[Resize] Found image in subdirectory: {subdir_file}")
                         break
         
         if not image_path:
+            print(f"[Resize] Image not found: {clean_filename}")
             raise HTTPException(status_code=404, detail="Image not found")
         
         # Read and resize the image

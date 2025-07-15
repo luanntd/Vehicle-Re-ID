@@ -93,19 +93,20 @@
             font-size: 1.25rem;
             border-radius: 0.5rem;
         }
-        #matchedGallery img {
+        .matched-vehicle-img {
             width: 100%;
-            height: auto;
+            max-width: 100px;
+            height: 70px;
             object-fit: cover;
             border-radius: 0.5rem;
             box-shadow: 0 2px 4px rgb(0 0 0 / 0.1);
             transition: transform 0.2s ease, opacity 0.3s ease;
             background-color: #f3f4f6;
         }
-        #matchedGallery img:hover {
+        .matched-vehicle-img:hover {
             transform: scale(1.05);
         }
-        #matchedGallery img[src=""] {
+        .matched-vehicle-img[src=""] {
             opacity: 0.5;
             background: linear-gradient(90deg, #f0f0f0 25%, transparent 50%, #f0f0f0 75%);
             background-size: 200% 100%;
@@ -115,19 +116,13 @@
             0% { background-position: 200% 0; }
             100% { background-position: -200% 0; }
         }
-        .match-item {
-            break-inside: avoid;
-            margin-bottom: 1rem;
-        }
-        #matchedGallery {
-            column-count: auto;
-            column-width: 300px;
-            column-gap: 1rem;
-        }
-        @media (max-width: 768px) {
-            #matchedGallery {
-                column-count: 1;
-            }
+        #matchedPairsContainer {
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+            max-height: 600px;
+            overflow-y: auto;
+            padding: 0.5rem;
         }
         .notification {
             position: fixed;
@@ -192,75 +187,111 @@
         </div>
     </header>
 
-    <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-        <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
-            <!-- Left Column: Controls & Status -->
-            <div class="lg:col-span-1 space-y-6">
-                <div class="card">
-                    <h2 class="text-xl font-bold mb-4">Controls</h2>
-                    <div class="space-y-4">
-                        <button id="startBtn" class="btn btn-primary w-full" disabled>Start Processing</button>
-                        <button id="stopBtn" class="btn btn-danger w-full" disabled>Stop Processing</button>
-                    </div>
-                </div>
-
-                <div class="card">
-                    <h2 class="text-xl font-bold mb-2">Session Status</h2>
-                    <div id="statusBar" class="status-bar status-info">Initializing...</div>
-                    <div class="mt-4 text-sm text-gray-600">
-                        <strong>Session ID:</strong> <span id="sessionId">N/A</span>
-                    </div>
-                </div>
-
-                <div class="card">
-                    <h2 class="text-xl font-bold mb-4">Camera 1 Upload</h2>
-                    <div id="uploadZone1" class="upload-zone">
-                        <p>Drag & drop video or click to select</p>
-                        <input type="file" id="videoFile1" class="hidden" accept="video/*">
-                    </div>
-                    <div id="uploadStatus1" class="mt-2 text-sm"></div>
-                </div>
-
-                <div class="card">
-                    <h2 class="text-xl font-bold mb-4">Camera 2 Upload</h2>
-                    <div id="uploadZone2" class="upload-zone">
-                        <p>Drag & drop video or click to select</p>
-                        <input type="file" id="videoFile2" class="hidden" accept="video/*">
-                    </div>
-                    <div id="uploadStatus2" class="mt-2 text-sm"></div>
-                </div>
-            </div>
-
-            <!-- Right Column: Video Feeds & Matches -->
-            <div class="lg:col-span-2 space-y-6">
-                <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+    <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6">
+        <div class="flex flex-col lg:flex-row gap-8">
+            <!-- Left Side: Main Content -->
+            <div class="lg:w-3/4 space-y-8">
+                <!-- Camera feeds section -->
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-8 mb-8">
+                    <!-- Camera 1 Feed -->
                     <div class="card">
                         <h3 class="text-lg font-bold mb-2">Camera 1 Feed</h3>
-                        <img id="cam1Feed" class="video-placeholder" src="" alt="Camera 1 Feed">
+                        <div class="border-2 border-gray-300 rounded-lg overflow-hidden">
+                            <img id="cam1Feed" class="w-full aspect-video object-cover" src="" alt="Camera 1 Feed">
+                        </div>
                         <div class="text-sm text-gray-500 mt-2">Frame Count: <span id="cam1FrameCount">0</span></div>
                     </div>
+
+                    <!-- Camera 2 Feed -->
                     <div class="card">
                         <h3 class="text-lg font-bold mb-2">Camera 2 Feed</h3>
-                        <img id="cam2Feed" class="video-placeholder" src="" alt="Camera 2 Feed">
+                        <div class="border-2 border-gray-300 rounded-lg overflow-hidden">
+                            <img id="cam2Feed" class="w-full aspect-video object-cover" src="" alt="Camera 2 Feed">
+                        </div>
                         <div class="text-sm text-gray-500 mt-2">Frame Count: <span id="cam2FrameCount">0</span></div>
                     </div>
                 </div>
 
-                <div class="card">
-                    <h2 class="text-xl font-bold mb-4">Matched Vehicles</h2>
-                    <div id="matchedGallery" class="masonry-grid">
-                        <p id="noMatchesText" class="text-gray-500 w-full">No matches found yet.</p>
+                <!-- Upload zones section -->
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-8 mb-8">
+                    <!-- Camera 1 Upload -->
+                    <div class="card">
+                        <h2 class="text-lg font-bold mb-4">Upload for Camera 1</h2>
+                        <div id="uploadZone1" class="upload-zone">
+                            <p>Drag & drop video or click to select</p>
+                            <input type="file" id="videoFile1" class="hidden" accept="video/*">
+                        </div>
+                        <div id="uploadStatus1" class="mt-2 text-sm"></div>
+                    </div>
+
+                    <!-- Camera 2 Upload -->
+                    <div class="card">
+                        <h2 class="text-lg font-bold mb-4">Upload for Camera 2</h2>
+                        <div id="uploadZone2" class="upload-zone">
+                            <p>Drag & drop video or click to select</p>
+                            <input type="file" id="videoFile2" class="hidden" accept="video/*">
+                        </div>
+                        <div id="uploadStatus2" class="mt-2 text-sm"></div>
                     </div>
                 </div>
-                
-                <div class="card">
-                    <h2 class="text-xl font-bold mb-4">Debug Log</h2>
-                    <div id="debugLog" class="h-40 bg-gray-800 text-white font-mono text-xs p-2 rounded overflow-y-auto"></div>
-                    <button id="clearLogBtn" class="btn btn-secondary mt-2 text-sm py-1 px-2">Clear Log</button>
+
+                <!-- Session & Debug section -->
+                <div class="grid grid-cols-1 md:grid-cols-4 gap-6">
+                    <!-- Session Status & Controls -->
+                    <div class="md:col-span-1">
+                        <div class="card mb-4">
+                            <h2 class="text-lg font-bold mb-2">Session Status & Info</h2>
+                            <div id="statusBar" class="status-bar status-info mb-2">Initializing...</div>
+                            <div class="text-sm text-gray-600">
+                                <strong>Session ID:</strong> <span id="sessionId">N/A</span>
+                            </div>
+                        </div>
+
+                        <div class="card">
+                            <button id="startBtn" class="btn btn-primary w-full mb-4" disabled>Start Processing</button>
+                            <button id="stopBtn" class="btn btn-danger w-full" disabled>Stop Processing</button>
+                        </div>
+                    </div>
+                    
+                    <!-- Debug Log -->
+                    <div class="md:col-span-3">
+                        <div class="card h-full">
+                            <div class="flex justify-between items-center mb-4">
+                                <h2 class="text-lg font-bold">Debug Log</h2>
+                                <button id="clearLogBtn" class="btn btn-secondary text-sm py-1 px-2">Clear Log</button>
+                            </div>
+                            <div id="debugLog" class="h-48 bg-gray-800 text-white font-mono text-xs p-3 rounded overflow-y-auto"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Right Side: Matched Vehicles -->
+            <div class="lg:w-1/4 flex-shrink-0">
+                <div class="card h-full">
+                    <h2 class="text-xl font-bold mb-4">Matched Vehicles</h2>
+                    
+                    <!-- Matched vehicle pairs will be displayed here -->
+                    <div id="matchedPairsContainer" class="flex flex-col gap-4">
+                        <p id="noMatchesPairsText" class="text-gray-500 text-center">No matches found yet.</p>
+                        <!-- Matched pairs will be added here dynamically -->
+                    </div>
+                    
+                    <div class="mt-6 text-center text-sm text-gray-500">
+                        <span>↓ Direction when new matches appear ↓</span>
+                    </div>
                 </div>
             </div>
         </div>
     </main>
+
+    <footer class="bg-white py-4 border-t mt-8">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <p class="text-center text-gray-500 text-sm">
+                Vehicle Re-ID Demo © 2025 | Built with FastAPI, Kafka, and Spark Streaming
+            </p>
+        </div>
+    </footer>
 
     <div id="notification" class="notification"></div>
 
@@ -294,8 +325,8 @@
             const cam2Feed = document.getElementById('cam2Feed');
             const cam1FrameCount = document.getElementById('cam1FrameCount');
             const cam2FrameCount = document.getElementById('cam2FrameCount');
-            const matchedGallery = document.getElementById('matchedGallery');
-            const noMatchesText = document.getElementById('noMatchesText');
+            const matchedPairsContainer = document.getElementById('matchedPairsContainer');
+            const noMatchesPairsText = document.getElementById('noMatchesPairsText');
             const debugLog = document.getElementById('debugLog');
             const clearLogBtn = document.getElementById('clearLogBtn');
 
@@ -345,20 +376,26 @@
 
                 websocket.onmessage = (event) => {
                     const msg = JSON.parse(event.data);
-                    logMessage(`WS IN: ${JSON.stringify(msg).substring(0, 100)}...`);
+                    
+                    // Only log non-frame messages or every 50th frame to avoid console flooding
+                    if (msg.type !== 'frame' || (msg.frame_count % 50 === 0)) {
+                        logMessage(`WS IN: ${msg.type === 'frame' ? `Frame from ${msg.camera} #${msg.frame_count}` : JSON.stringify(msg).substring(0, 100) + '...'}`);
+                    }
 
                     if (msg.type === 'frame') {
                         const feed = msg.camera === 'cam1' ? cam1Feed : cam2Feed;
                         const countEl = msg.camera === 'cam1' ? cam1FrameCount : cam2FrameCount;
                         
                         feed.src = `data:image/jpeg;base64,${msg.data}`;
-                        if (feed.classList.contains('video-placeholder')) {
-                            feed.classList.remove('video-placeholder');
-                        }
+                        feed.classList.remove('video-placeholder');
                         countEl.textContent = msg.frame_count;
                     } else if (msg.type === 'match') {
-                        // This is now handled by fetchLatestMatches
-                        logMessage(`Match notification received (but handled by polling): ${msg.filename}`);
+                        // Update matches immediately on match notification, don't wait for the poll
+                        logMessage(`Match notification received: ${msg.filename}`);
+                        fetchLatestMatches();
+                    } else if (msg.type === 'heartbeat') {
+                        // Handle heartbeat silently
+                        console.log('Heartbeat received', msg.timestamp);
                     }
                 };
 
@@ -377,7 +414,8 @@
 
             // --- API CALLS ---
             async function fetchLatestMatches() {
-                if (!processing) return;
+                // Always fetch matches even if not processing, to show test images
+                // if (!processing) return;
 
                 try {
                     const response = await fetch(`${API_BASE_URL}/latest_matches`);
@@ -388,52 +426,281 @@
                     const data = await response.json();
                     
                     if (data.matches && data.matches.length > 0) {
-                        if (noMatchesText) noMatchesText.style.display = 'none';
+                        logMessage(`Found ${data.matches.length} matches from server`);
+                        console.log("Matches data:", data.matches);
                         
-                        // Clear existing matches to prevent duplicates and show only the latest set
-                        matchedGallery.innerHTML = '';
-
-                        data.matches.forEach(match => {
-                            const matchContainer = document.createElement('div');
-                            matchContainer.className = 'match-item border p-3 rounded-lg bg-white shadow-sm';
-                            
-                            const title = document.createElement('p');
-                            title.className = 'font-bold text-sm mb-2 text-gray-800';
-                            title.textContent = `Match: ${match.filename}`;
-                            matchContainer.appendChild(title);
-
-                            const img = document.createElement('img');
-                            // Use the thumbnail URL for better performance
-                            const baseUrl = match.thumbnail_url || match.path;
-                            const separator = baseUrl.includes('?') ? '&' : '?';
-                            img.src = `${API_BASE_URL}${baseUrl}${separator}t=${new Date().getTime()}`;
-                            img.alt = match.filename;
-                            img.title = `File: ${match.filename}\nTime: ${match.timestamp}`;
-                            img.className = 'w-full h-auto rounded cursor-pointer transition-transform hover:scale-105';
-                            img.style.maxWidth = '100%';
-                            img.style.height = 'auto';
-                            img.style.objectFit = 'contain';
-                            
-                            // Add click handler to show full-size image
-                            img.addEventListener('click', () => {
-                                showFullSizeImage(match.path, match.filename);
-                            });
-                            
-                            matchContainer.appendChild(img);
-                            
-                            // Add timestamp
-                            const timeDiv = document.createElement('div');
-                            timeDiv.className = 'text-xs text-gray-500 mt-2';
-                            timeDiv.textContent = new Date(match.timestamp).toLocaleString();
-                            matchContainer.appendChild(timeDiv);
-                            
-                            matchedGallery.appendChild(matchContainer);
-                        });
+                        // Group matches by camera
+                        const cam1Matches = data.matches.filter(match => match.filename.includes('cam1'));
+                        const cam2Matches = data.matches.filter(match => match.filename.includes('cam2'));
+                        
+                        logMessage(`Camera 1 matches: ${cam1Matches.length}, Camera 2 matches: ${cam2Matches.length}`);
+                        
+                        // For test images, if no cam1/cam2 prefixes found, assign them manually
+                        if (cam1Matches.length === 0 && cam2Matches.length === 0 && data.matches.length > 0) {
+                            logMessage("No camera prefixes found in filenames, assigning manually");
+                            // Assign first image to cam1, second to cam2
+                            if (data.matches.length >= 1) {
+                                const match1 = {...data.matches[0]};
+                                match1.filename = `cam1_${match1.filename}`;
+                                cam1Matches.push(match1);
+                            }
+                            if (data.matches.length >= 2) {
+                                const match2 = {...data.matches[1]};
+                                match2.filename = `cam2_${match2.filename}`;
+                                cam2Matches.push(match2);
+                            }
+                            logMessage(`Assigned manually - Camera 1: ${cam1Matches.length}, Camera 2: ${cam2Matches.length}`);
+                        }
+                        
+                        // Extract vehicle IDs from filenames and pair the matches
+                        const vehiclePairs = createVehiclePairs(cam1Matches, cam2Matches);
+                        
+                        // Update the UI with the matched pairs
+                        updateMatchedPairsDisplay(vehiclePairs);
                     }
                 } catch (error) {
                     console.error('Error fetching latest matches:', error);
                     logMessage('Could not fetch latest matches.');
                 }
+            }
+            
+            // Function to create vehicle pairs from camera matches
+            function createVehiclePairs(cam1Matches, cam2Matches) {
+                // Map to store pairs by vehicle ID
+                const vehiclePairs = new Map();
+                
+                // Helper function to extract vehicle ID from filename
+                const getVehicleId = (filename) => {
+                    // Try to extract vehicle ID from filename
+                    // This regex pattern looks for "vehicle_123" or similar patterns
+                    const match = filename.match(/vehicle[_-](\d+)|track[_-](\d+)/i);
+                    if (match) {
+                        return match[1] || match[2];
+                    }
+                    
+                    // For test images that don't have a standard vehicle ID format
+                    // Just use the first part of the filename as the ID
+                    const testImageMatch = filename.match(/cam\d+_(.+)\.jpg$/i);
+                    if (testImageMatch) {
+                        // Return first 8 chars of filename to use as ID
+                        return testImageMatch[1].substring(0, 8);
+                    }
+                    
+                    // If no ID can be extracted, use a part of the filename
+                    return filename.replace(/\.[^/.]+$/, "").substring(0, 8); // Remove extension and limit length
+                };
+                
+                // Process camera 1 matches
+                cam1Matches.forEach(match => {
+                    const id = getVehicleId(match.filename);
+                    if (id) {
+                        if (!vehiclePairs.has(id)) {
+                            vehiclePairs.set(id, { cam1: match, cam2: null });
+                        } else {
+                            vehiclePairs.get(id).cam1 = match;
+                        }
+                    }
+                });
+                
+                // Process camera 2 matches and pair with camera 1 matches
+                cam2Matches.forEach(match => {
+                    const id = getVehicleId(match.filename);
+                    if (id) {
+                        if (!vehiclePairs.has(id)) {
+                            vehiclePairs.set(id, { cam1: null, cam2: match });
+                        } else {
+                            vehiclePairs.get(id).cam2 = match;
+                        }
+                    }
+                });
+                
+                return vehiclePairs;
+            }
+            
+            // Function to update the UI with matched vehicle pairs
+            function updateMatchedPairsDisplay(vehiclePairs) {
+                if (!matchedPairsContainer) return;
+                
+                // Add debug logging
+                logMessage(`Updating display with ${vehiclePairs.size} vehicle pairs`);
+                
+                // If there are no pairs, show the "no matches" message
+                if (vehiclePairs.size === 0) {
+                    noMatchesPairsText.style.display = 'block';
+                    matchedPairsContainer.innerHTML = '';
+                    return;
+                }
+                
+                // Hide the "no matches" message and prepare to display pairs
+                noMatchesPairsText.style.display = 'none';
+                matchedPairsContainer.innerHTML = '';
+                
+                // Force processing to true to ensure images are visible for test images
+                processing = true;
+                
+                // Convert the map to an array and sort by ID for consistent display
+                const sortedPairs = Array.from(vehiclePairs.entries())
+                    .sort((a, b) => {
+                        // For test images, which might have string IDs, use string comparison
+                        if (isNaN(parseInt(a[0])) || isNaN(parseInt(b[0]))) {
+                            return a[0].localeCompare(b[0]);
+                        }
+                        // Sort by ID numerically for standard vehicle IDs
+                        return parseInt(a[0]) - parseInt(b[0]);
+                    });
+                
+                // Create a row for each vehicle pair
+                sortedPairs.forEach(([vehicleId, pair]) => {
+                    const pairElement = createMatchPairElement(vehicleId, pair);
+                    matchedPairsContainer.appendChild(pairElement);
+                });
+            }
+            
+            // Helper function to create a match pair element
+            function createMatchPairElement(vehicleId, pair) {
+                // Create container for the pair
+                const pairContainer = document.createElement('div');
+                pairContainer.className = 'bg-gray-50 p-3 rounded-lg mb-3';
+                
+                // Create header with vehicle ID
+                const headerDiv = document.createElement('div');
+                headerDiv.className = 'font-semibold text-sm mb-2 text-center';
+                headerDiv.textContent = `Vehicle ID: ${vehicleId}`;
+                pairContainer.appendChild(headerDiv);
+                
+                // Create flex container for the two images
+                const imagesContainer = document.createElement('div');
+                imagesContainer.className = 'flex justify-between items-center gap-2';
+                
+                // Camera 1 image
+                const cam1Container = document.createElement('div');
+                cam1Container.className = 'flex-1 flex flex-col items-center';
+                
+                const cam1Label = document.createElement('div');
+                cam1Label.className = 'text-xs font-medium mb-1';
+                cam1Label.textContent = 'Camera 1';
+                cam1Container.appendChild(cam1Label);
+                
+                if (pair.cam1) {
+                    const img1 = document.createElement('img');
+                    const baseUrl = pair.cam1.small_thumbnail_url || pair.cam1.thumbnail_url || pair.cam1.path;
+                    const separator = baseUrl.includes('?') ? '&' : '?';
+                    
+                    // Log the image URL for debugging
+                    console.log(`Camera 1 image URL: ${API_BASE_URL}${baseUrl}${separator}t=${new Date().getTime()}`);
+                    logMessage(`Loading Camera 1 image: ${pair.cam1.filename}`);
+                    
+                    img1.src = `${API_BASE_URL}${baseUrl}${separator}t=${new Date().getTime()}`;
+                    img1.alt = 'Vehicle from Camera 1';
+                    img1.className = 'matched-vehicle-img cursor-pointer';
+                    img1.title = `${pair.cam1.filename}\n${new Date(pair.cam1.timestamp).toLocaleTimeString()}`;
+                    
+                    // Add error handler for image loading
+                    img1.onerror = (e) => {
+                        console.error(`Failed to load image: ${img1.src}`, e);
+                        logMessage(`Failed to load Camera 1 image: ${pair.cam1.filename}`);
+                        // Replace with placeholder
+                        img1.src = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='100' height='100' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' fill='%23f0f0f0'/%3E%3Ctext x='50' y='50' font-family='Arial' font-size='12' text-anchor='middle' dominant-baseline='middle' fill='%23999'%3EImage Error%3C/text%3E%3C/svg%3E";
+                    };
+                    
+                    // Add load handler
+                    img1.onload = () => {
+                        logMessage(`Camera 1 image loaded: ${pair.cam1.filename}`);
+                    };
+                    
+                    img1.addEventListener('click', () => {
+                        showFullSizeImage(pair.cam1.path, pair.cam1.filename);
+                    });
+                    
+                    cam1Container.appendChild(img1);
+                    
+                    // Show timestamp if available
+                    if (pair.cam1.timestamp) {
+                        const time = document.createElement('div');
+                        time.className = 'text-xs text-gray-500 mt-1';
+                        time.textContent = new Date(pair.cam1.timestamp).toLocaleTimeString();
+                        cam1Container.appendChild(time);
+                    }
+                } else {
+                    // Placeholder if no image for camera 1
+                    const placeholder = document.createElement('div');
+                    placeholder.className = 'matched-vehicle-img flex items-center justify-center bg-gray-200 text-gray-400 text-xs';
+                    placeholder.textContent = 'No match';
+                    cam1Container.appendChild(placeholder);
+                }
+                
+                // Arrow between images
+                const arrowContainer = document.createElement('div');
+                arrowContainer.className = 'flex-shrink-0 px-2';
+                const arrow = document.createElement('div');
+                arrow.className = 'text-gray-400 font-bold';
+                arrow.innerHTML = '⟷'; // Bidirectional arrow
+                arrowContainer.appendChild(arrow);
+                
+                // Camera 2 image
+                const cam2Container = document.createElement('div');
+                cam2Container.className = 'flex-1 flex flex-col items-center';
+                
+                const cam2Label = document.createElement('div');
+                cam2Label.className = 'text-xs font-medium mb-1';
+                cam2Label.textContent = 'Camera 2';
+                cam2Container.appendChild(cam2Label);
+                
+                if (pair.cam2) {
+                    const img2 = document.createElement('img');
+                    const baseUrl = pair.cam2.small_thumbnail_url || pair.cam2.thumbnail_url || pair.cam2.path;
+                    const separator = baseUrl.includes('?') ? '&' : '?';
+                    
+                    // Log the image URL for debugging
+                    console.log(`Camera 2 image URL: ${API_BASE_URL}${baseUrl}${separator}t=${new Date().getTime()}`);
+                    logMessage(`Loading Camera 2 image: ${pair.cam2.filename}`);
+                    
+                    img2.src = `${API_BASE_URL}${baseUrl}${separator}t=${new Date().getTime()}`;
+                    img2.alt = 'Vehicle from Camera 2';
+                    img2.className = 'matched-vehicle-img cursor-pointer';
+                    img2.title = `${pair.cam2.filename}\n${new Date(pair.cam2.timestamp).toLocaleTimeString()}`;
+                    
+                    // Add error handler for image loading
+                    img2.onerror = (e) => {
+                        console.error(`Failed to load image: ${img2.src}`, e);
+                        logMessage(`Failed to load Camera 2 image: ${pair.cam2.filename}`);
+                        // Replace with placeholder
+                        img2.src = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='100' height='100' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' fill='%23f0f0f0'/%3E%3Ctext x='50' y='50' font-family='Arial' font-size='12' text-anchor='middle' dominant-baseline='middle' fill='%23999'%3EImage Error%3C/text%3E%3C/svg%3E";
+                    };
+                    
+                    // Add load handler
+                    img2.onload = () => {
+                        logMessage(`Camera 2 image loaded: ${pair.cam2.filename}`);
+                    };
+                    
+                    img2.addEventListener('click', () => {
+                        showFullSizeImage(pair.cam2.path, pair.cam2.filename);
+                    });
+                    
+                    cam2Container.appendChild(img2);
+                    
+                    // Show timestamp if available
+                    if (pair.cam2.timestamp) {
+                        const time = document.createElement('div');
+                        time.className = 'text-xs text-gray-500 mt-1';
+                        time.textContent = new Date(pair.cam2.timestamp).toLocaleTimeString();
+                        cam2Container.appendChild(time);
+                    }
+                } else {
+                    // Placeholder if no image for camera 2
+                    const placeholder = document.createElement('div');
+                    placeholder.className = 'matched-vehicle-img flex items-center justify-center bg-gray-200 text-gray-400 text-xs';
+                    placeholder.textContent = 'No match';
+                    cam2Container.appendChild(placeholder);
+                }
+                
+                // Add all elements to the container
+                imagesContainer.appendChild(cam1Container);
+                imagesContainer.appendChild(arrowContainer);
+                imagesContainer.appendChild(cam2Container);
+                pairContainer.appendChild(imagesContainer);
+                
+                return pairContainer;
             }
 
             // Function to show full-size image in modal
@@ -493,7 +760,11 @@
                     
                     connectWebSocket();
                     updateButtons();
-                    // Start polling for matches once processing starts
+                    
+                    // Fetch matches immediately to show test images
+                    fetchLatestMatches();
+                    
+                    // Start polling for matches every 5 seconds
                     setInterval(fetchLatestMatches, 5000); // Poll every 5 seconds
                 } catch (error) {
                     console.error('Failed to start session:', error);
@@ -591,23 +862,38 @@
                 const input = document.getElementById(inputId);
 
                 zone.addEventListener('click', () => input.click());
+                
                 zone.addEventListener('dragover', (e) => {
                     e.preventDefault();
                     zone.classList.add('drag-over');
                 });
-                zone.addEventListener('dragleave', () => zone.classList.remove('drag-over'));
+                
+                zone.addEventListener('dragleave', () => {
+                    zone.classList.remove('drag-over');
+                });
+                
                 zone.addEventListener('drop', (e) => {
                     e.preventDefault();
                     zone.classList.remove('drag-over');
-                    const file = e.dataTransfer.files[0];
-                    if (file) {
-                        uploadFile(cameraName, file);
+                    
+                    if (e.dataTransfer.files.length > 0) {
+                        const file = e.dataTransfer.files[0];
+                        if (file.type.startsWith('video/')) {
+                            uploadFile(cameraName, file);
+                        } else {
+                            showNotification('Please upload a video file.', 'error');
+                        }
                     }
                 });
+                
                 input.addEventListener('change', (e) => {
-                    const file = e.target.files[0];
-                    if (file) {
-                        uploadFile(cameraName, file);
+                    if (e.target.files.length > 0) {
+                        const file = e.target.files[0];
+                        if (file.type.startsWith('video/')) {
+                            uploadFile(cameraName, file);
+                        } else {
+                            showNotification('Please upload a video file.', 'error');
+                        }
                     }
                 });
             }
