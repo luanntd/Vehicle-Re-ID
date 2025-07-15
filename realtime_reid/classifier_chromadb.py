@@ -245,13 +245,15 @@ class ChromaDBVehicleReID:
         # Only skip if both camera_id and track_id are valid values
         if camera_id != 'unknown' and track_id != -1:
             try:
-                existing_records = collection.get(
-                    where={
-                        "vehicle_id": vehicle_id,
-                        "camera_id": camera_id,
-                        "track_id": track_id
-                    }
-                )
+                # Using proper operator format for ChromaDB where clause
+                where_clause = {
+                    "$and": [
+                        {"vehicle_id": {"$eq": vehicle_id}},
+                        {"camera_id": {"$eq": camera_id}}
+                    ]
+                }
+                
+                existing_records = collection.get(where=where_clause)
                 
                 # If this exact camera/track combination already exists for this vehicle_id,
                 # don't add another duplicate record
@@ -260,6 +262,7 @@ class ChromaDBVehicleReID:
                     return
             except Exception as e:
                 print(f"Error checking for existing records: {e}")
+                # Continue with adding the embedding even if checking fails
         
         # Generate unique document ID
         doc_id = str(uuid.uuid4())
@@ -312,8 +315,11 @@ class ChromaDBVehicleReID:
         collection = self.collections[vehicle_type]
         
         try:
+            # Use proper operator format for ChromaDB where clause
+            where_clause = {"vehicle_id": {"$eq": vehicle_id}}
+            
             results = collection.get(
-                where={"vehicle_id": vehicle_id},
+                where=where_clause,
                 include=['metadatas', 'embeddings']
             )
             

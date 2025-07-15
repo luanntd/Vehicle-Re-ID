@@ -92,7 +92,7 @@ class Pipeline:
                     if len(camera_matches) > 1:
                         # Use (camera_id, track_id) as key to ensure uniqueness per camera/track combination
                         # This prevents duplicate image saving for the same track in a camera
-                        vehicle_key = (camera_id, track_id)
+                        vehicle_key = (camera_id, vehicle_id)
                         print(f"CROSS-CAMERA MATCH! Vehicle ID: {vehicle_id} ({VEHICLE_LABELS.get(cls, f'class_{cls}')}) found in cameras: {list(camera_matches.keys())}")
                         
                         # Only save images once per camera/track combination to avoid duplicates
