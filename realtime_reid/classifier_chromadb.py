@@ -237,6 +237,30 @@ class ChromaDBVehicleReID:
         """Add embedding and metadata to ChromaDB."""
         collection = self.collections[vehicle_type]
         
+        # Normalize parameters to avoid None values
+        camera_id = camera_id or 'unknown'
+        track_id = track_id or -1
+        
+        # Check if a vehicle with the same vehicle_id, camera_id and track_id already exists
+        # Only skip if both camera_id and track_id are valid values
+        if camera_id != 'unknown' and track_id != -1:
+            try:
+                existing_records = collection.get(
+                    where={
+                        "vehicle_id": vehicle_id,
+                        "camera_id": camera_id,
+                        "track_id": track_id
+                    }
+                )
+                
+                # If this exact camera/track combination already exists for this vehicle_id,
+                # don't add another duplicate record
+                if existing_records and len(existing_records['ids']) > 0:
+                    # print(f"Skipping duplicate for vehicle_id={vehicle_id}, camera={camera_id}, track={track_id}")
+                    return
+            except Exception as e:
+                print(f"Error checking for existing records: {e}")
+        
         # Generate unique document ID
         doc_id = str(uuid.uuid4())
         
@@ -249,8 +273,8 @@ class ChromaDBVehicleReID:
             'vehicle_type': vehicle_type,
             'vehicle_type_name': self.VEHICLE_TYPES[vehicle_type],
             'confidence': confidence,
-            'camera_id': camera_id or 'unknown',
-            'track_id': track_id or -1,
+            'camera_id': camera_id,
+            'track_id': track_id,
             'timestamp': timestamp or datetime.now().isoformat(),
         }
         
