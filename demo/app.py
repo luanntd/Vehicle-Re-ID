@@ -21,6 +21,8 @@ from kafka.admin import KafkaAdminClient, NewTopic
 import time
 from queue import Queue
 import numpy as np
+import gc
+import traceback
 
 # Global queue for WebSocket messages
 websocket_queue = Queue()
@@ -45,8 +47,8 @@ def ensure_kafka_topic(session_id, bootstrap_servers):
 # Add the parent directory to Python path to import custom modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from vehicle_reid.streaming.spark_streaming import start_spark
-from vehicle_reid.streaming.producer import VideoProducer
+from streaming.spark_streaming import start_spark
+from streaming.kafka_producer import VideoProducer
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Capture the main event loop on startup."""
@@ -543,23 +545,23 @@ async def start_processing(session_id: str):
         
         # Start cam1 producer with controlled frame rate
         producer1 = VideoProducer(
-            video_path=session_data["cameras"]["cam1"],
-            topic_name=f"cam1_{session_id}",
+            topic=f"cam1_{session_id}",
             bootstrap_servers="localhost:9092",
-            fps= None  # Set to 6 FPS for controlled streaming
+            fps=6.0,  # Set to 6 FPS for controlled streaming
+            mode='streaming'
         )
         
         # Start cam2 producer with controlled frame rate
         producer2 = VideoProducer(
-            video_path=session_data["cameras"]["cam2"],
-            topic_name=f"cam2_{session_id}",
+            topic=f"cam2_{session_id}",
             bootstrap_servers="localhost:9092",
-            fps= None  # Set to 6 FPS for controlled streaming
+            fps=6.0,  # Set to 6 FPS for controlled streaming
+            mode='streaming'
         )
         
         # Start producers in threads
-        producer1_thread = threading.Thread(target=producer1.start_streaming)
-        producer2_thread = threading.Thread(target=producer2.start_streaming)
+        producer1_thread = threading.Thread(target=producer1.start_streaming, args=(session_data["cameras"]["cam1"],))
+        producer2_thread = threading.Thread(target=producer2.start_streaming, args=(session_data["cameras"]["cam2"],))
         
         producer1_thread.start()
         producer2_thread.start()

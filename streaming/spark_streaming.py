@@ -10,10 +10,10 @@ from pathlib import Path
 import time
 import traceback
 import gc
-from realtime_reid.pipeline import Pipeline
-from realtime_reid.vehicle_detector import VehicleDetector
-from realtime_reid.feature_extraction import VehicleDescriptor
-from realtime_reid.classifier_chromadb import ChromaDBVehicleReID
+from modules.pipeline import Pipeline
+from modules.vehicle_detection import VehicleDetector
+from modules.feature_extraction import VehicleDescriptor
+from modules.reid_chromadb import ChromaDBVehicleReID
 
 # Configure Python's garbage collector for better memory management
 gc.set_threshold(100, 5, 5)

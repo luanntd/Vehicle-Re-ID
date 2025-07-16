@@ -5,7 +5,7 @@ from datetime import datetime
 from .reid_chromadb import ChromaDBVehicleReID
 from .feature_extraction import VehicleDescriptor
 from .vehicle_detection import VehicleDetector
-from ..utils import color
+from . import color
 
 class Pipeline:
     def __init__(self,

@@ -88,8 +88,8 @@ def process_messages(consumer: KafkaConsumer):
         import gc
         gc.collect()
     finally:
-        print("Closing Kafka consumer")
-        consumer.close()
+        print("Waiting Kafka consumer")
+        # consumer.close()
 
 def start_threads(consumer_00: KafkaConsumer,
                   consumer_01: KafkaConsumer):
@@ -271,36 +271,97 @@ def display_images():
         cv2.destroyAllWindows()
         os._exit(0)
 
-def ensure_kafka_topic(topic_name, bootstrap_servers):
-    """Check if a Kafka topic exists, and create it if not."""
-    admin_client = None
-    try:
-        admin_client = KafkaAdminClient(bootstrap_servers=bootstrap_servers)
-        existing_topics = admin_client.list_topics()
-        
+def ensure_kafka_topic(session_id, bootstrap_servers):
+    """Check if a Kafka topic exists, and create it if not. Based on app.py approach."""
+    admin_client = KafkaAdminClient(bootstrap_servers=bootstrap_servers)
+    existing_topics = admin_client.list_topics()
+    topic_names = [f'cam1_{session_id}', f'cam2_{session_id}', f'cam1_processed_{session_id}', f'cam2_processed_{session_id}']
+    
+    for topic_name in topic_names:
         if topic_name not in existing_topics:
             try:
                 admin_client.create_topics([NewTopic(name=topic_name, num_partitions=1, replication_factor=1)])
                 print(f"Created Kafka topic: {topic_name}")
-                # Wait a bit for topic to be fully created
-                time.sleep(2)
             except Exception as e:
                 print(f"Error creating topic {topic_name}: {e}")
-                # Topic might already exist due to race condition, continue anyway
         else:
             print(f"Kafka topic already exists: {topic_name}")
+    
+    admin_client.close()
+
+def ensure_kafka_topic_with_retry(topic_name, bootstrap_servers, max_retries=30, retry_delay=2):
+    """Enhanced topic verification with retry logic like app.py consumer approach."""
+    admin_client = None
+    try:
+        admin_client = KafkaAdminClient(bootstrap_servers=bootstrap_servers)
         
-        # Return a consumer for the topic
-        consumer = KafkaConsumer(
-            topic_name,
-            bootstrap_servers=[bootstrap_servers],
-            auto_offset_reset='latest',  # Start from latest messages
-            value_deserializer=None,     # We handle bytes manually
-            consumer_timeout_ms=1000     # Timeout for testing if topic exists
-        )
+        # Check if topic already exists
+        for attempt in range(max_retries):
+            try:
+                existing_topics = admin_client.list_topics()
+                
+                if topic_name not in existing_topics:
+                    if attempt == 0:  # Only try to create on first attempt
+                        try:
+                            admin_client.create_topics([NewTopic(name=topic_name, num_partitions=1, replication_factor=1)])
+                            print(f"Created Kafka topic: {topic_name}")
+                        except Exception as e:
+                            print(f"Note: Could not create topic {topic_name}: {e}")
+                            print("Topic might be created by Spark streaming...")
+                    
+                    print(f"Waiting for topic {topic_name} to be available (attempt {attempt + 1}/{max_retries})...")
+                    time.sleep(retry_delay)
+                    continue
+                else:
+                    print(f"Kafka topic found: {topic_name}")
+                    break
+                    
+            except Exception as e:
+                print(f"Error checking topics (attempt {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    continue
+                else:
+                    raise e
+        else:
+            # If we exit the loop without breaking, topic was not found
+            raise Exception(f"Topic {topic_name} was not available after {max_retries} attempts")
         
-        print(f"Successfully connected to Kafka topic: {topic_name}")
-        return consumer
+        # Try to create consumer with retries (similar to app.py kafka_consumer_thread)
+        for attempt in range(5):
+            try:
+                consumer = KafkaConsumer(
+                    topic_name,
+                    bootstrap_servers=[bootstrap_servers],
+                    auto_offset_reset='latest',  # Start from latest messages
+                    value_deserializer=None,     # We handle bytes manually
+                    consumer_timeout_ms=2000,    # Increased timeout like app.py
+                    fetch_min_bytes=1,
+                    fetch_max_wait_ms=500,
+                    max_poll_records=10,
+                    enable_auto_commit=True,
+                    auto_commit_interval_ms=1000,
+                    fetch_max_bytes=52428800,       # 50MB like app.py
+                    max_in_flight_requests_per_connection=5,
+                    receive_buffer_bytes=67108864,  # 64MB like app.py
+                    session_timeout_ms=30000,       # Increased session timeout
+                    heartbeat_interval_ms=3000,     # Heartbeat every 3 seconds
+                    max_poll_interval_ms=300000,    # 5 minutes max poll interval
+                    group_id=f'consumer_{topic_name}_{int(time.time())}'  # Unique group ID
+                )
+                
+                # Test the connection
+                consumer.poll(timeout_ms=1000)
+                print(f"Successfully connected to Kafka topic: {topic_name}")
+                return consumer
+                
+            except Exception as e:
+                print(f"Error connecting to consumer (attempt {attempt + 1}/5): {e}")
+                if attempt < 4:
+                    time.sleep(2)
+                    continue
+                else:
+                    raise e
         
     except Exception as e:
         print(f"Failed to connect to Kafka topic {topic_name}: {e}")
@@ -309,43 +370,189 @@ def ensure_kafka_topic(topic_name, bootstrap_servers):
         if admin_client:
             admin_client.close()
 
+def verify_spark_output(topic_name, bootstrap_servers, timeout=60):
+    """Verify that Spark is actually producing data to the processed topic."""
+    print(f"Verifying Spark output to topic: {topic_name}")
+    
+    try:
+        # Create a temporary consumer to check for messages
+        test_consumer = KafkaConsumer(
+            topic_name,
+            bootstrap_servers=[bootstrap_servers],
+            auto_offset_reset='latest',
+            value_deserializer=None,
+            consumer_timeout_ms=timeout * 1000,  # Convert to ms
+            fetch_min_bytes=1,
+            fetch_max_wait_ms=1000
+        )
+        
+        print(f"Waiting up to {timeout} seconds for Spark to produce data...")
+        
+        # Try to get at least one message
+        messages = test_consumer.poll(timeout_ms=timeout * 1000)
+        
+        if messages:
+            message_count = sum(len(msgs) for msgs in messages.values())
+            print(f"✓ Spark is producing data to {topic_name} ({message_count} messages found)")
+            test_consumer.close()
+            return True
+        else:
+            print(f"✗ No data found in {topic_name} after {timeout} seconds")
+            test_consumer.close()
+            return False
+            
+    except Exception as e:
+        print(f"Error verifying Spark output: {e}")
+        return False
+
+def check_chromadb_setup():
+    """Check if ChromaDB is properly set up."""
+    try:
+        # Try to import ChromaDB
+        import chromadb
+        print("✓ ChromaDB is installed and importable")
+        
+        # Try to create a test client
+        test_client = chromadb.Client()
+        print("✓ ChromaDB client can be created")
+        
+        return True
+        
+    except ImportError as e:
+        print(f"✗ ChromaDB import error: {e}")
+        print("Please install ChromaDB: pip install chromadb")
+        return False
+    except Exception as e:
+        print(f"✗ ChromaDB setup error: {e}")
+        return False
+
 def main():
+    # Extract session ID from topics (assuming format: cam1_sessionId, cam2_sessionId)
+    session_id = None
+    if "_" in TOPIC_1:
+        session_id = TOPIC_1.split("_", 1)[1]
+    elif "_" in TOPIC_2 and TOPIC_2 != "NULL":
+        session_id = TOPIC_2.split("_", 1)[1]
+    
+    if not session_id:
+        print("ERROR: Could not extract session ID from topics. Please use format: cam1_sessionId, cam2_sessionId")
+        return
+    
+    print(f"Extracted session ID: {session_id}")
+    
+    # Use app.py approach for topic management
+    print("Creating Kafka topics using app.py approach...")
+    ensure_kafka_topic(session_id, BOOTSTRAP_SERVERS)
+    
     admin_client = KafkaAdminClient(bootstrap_servers=BOOTSTRAP_SERVERS)
-    print("Current kafka topics: {}".format(admin_client.list_topics()))
-    time.sleep(5)  # Wait for a moment to ensure the topics are listed correctly
+    current_topics = admin_client.list_topics()
+    print("Current kafka topics: {}".format(current_topics))
+    
+    # Check if input topics exist
+    if TOPIC_1 not in current_topics:
+        print(f"ERROR: Input topic '{TOPIC_1}' does not exist!")
+        print("Please create the input topic first or run the producer.")
+        admin_client.close()
+        return
+        
+    if TOPIC_2 and TOPIC_2 != "NULL" and TOPIC_2 not in current_topics:
+        print(f"ERROR: Input topic '{TOPIC_2}' does not exist!")
+        print("Please create the input topic first or run the producer.")
+        admin_client.close()
+        return
+        
+    print("✓ Input topics verified.")
     admin_client.close()
 
+    # Check ChromaDB setup
+    print("Checking ChromaDB setup...")
+    if not check_chromadb_setup():
+        print("ChromaDB setup failed. Exiting.")
+        return
+
     # Start Spark streaming with proper error handling
-    from vehicle_reid.streaming.spark_streaming import start_spark
+    from streaming.spark_streaming import start_spark
     spark_thread = None
     try:
         print("Starting Spark streaming...")
-        spark_thread = start_spark()  # start_spark() returns the thread
+        # Use app.py approach - pass session_id and base_dir
+        from pathlib import Path
+        base_dir = Path(__file__).resolve().parent
+        spark_thread = start_spark(session_id, base_dir=base_dir)
         print("Spark streaming started.")
         
-        # Wait a bit for Spark to initialize and create output topics
-        print("Waiting for Spark streaming to initialize...")
-        time.sleep(10)
+        # Wait longer for Spark to initialize and create output topics (like app.py)
+        print("Waiting for Spark streaming to initialize and create output topics...")
+        time.sleep(30)  # Same as app.py
         
     except Exception as e:
         print(f"Error starting Spark streaming: {e}")
         print("Consumer will exit since Spark streaming failed to start.")
         return
         
-    # Ensure Kafka topics exist (topics that Spark creates)
-    processed_topic1 = TOPIC_1 + "_processed"
-    processed_topic2 = TOPIC_2 + "_processed" if TOPIC_2 and TOPIC_2 != "NULL" else None
+    # Generate processed topic names using session-based approach from app.py
+    processed_topic1 = f"{TOPIC_1}_processed"
+    processed_topic2 = f"{TOPIC_2}_processed" if TOPIC_2 and TOPIC_2 != "NULL" else None
+    
+    print(f"Looking for processed topics: {processed_topic1}, {processed_topic2}")
     
     try:
-        consumer_00 = ensure_kafka_topic(processed_topic1, BOOTSTRAP_SERVERS)
+        # Wait for Spark to create the processed topics (using app.py approach)
+        print("Connecting to processed topics...")
+        consumer_00 = ensure_kafka_topic_with_retry(processed_topic1, BOOTSTRAP_SERVERS, max_retries=60, retry_delay=5)
+        
         if processed_topic2:
-            consumer_01 = ensure_kafka_topic(processed_topic2, BOOTSTRAP_SERVERS)
+            consumer_01 = ensure_kafka_topic_with_retry(processed_topic2, BOOTSTRAP_SERVERS, max_retries=60, retry_delay=5)
         else:
             consumer_01 = None
+            
+        print("Successfully connected to all required topics.")
+        
+        # Verify that Spark is actually producing data
+        print("Verifying Spark streaming is working...")
+        if not verify_spark_output(processed_topic1, BOOTSTRAP_SERVERS, timeout=60):
+            print("WARNING: Spark doesn't seem to be producing data to processed topics.")
+            print("This could mean:")
+            print("1. Input topics are empty")
+            print("2. Spark streaming encountered an error")
+            print("3. ChromaDB configuration issues")
+            print("Continuing anyway...")
+        
     except Exception as e:
         print(f"Error creating/connecting to Kafka topics: {e}")
+        print("This usually means Spark streaming hasn't started producing to processed topics yet.")
+        print("Make sure:")
+        print("1. Kafka is running")
+        print("2. Input topics exist and have data")
+        print("3. Spark streaming is processing correctly")
         return
         
+    # Verify Spark is producing data to the processed topics (using enhanced verification)
+    try:
+        if not verify_spark_output(processed_topic1, BOOTSTRAP_SERVERS, timeout=60):
+            print(f"Spark does not appear to be producing data to {processed_topic1}.")
+            print("This might be normal if input topics are empty or Spark is still initializing.")
+            print("Continuing with consumer setup...")
+        
+        if processed_topic2 and processed_topic2 != "NULL":
+            if not verify_spark_output(processed_topic2, BOOTSTRAP_SERVERS, timeout=60):
+                print(f"Spark does not appear to be producing data to {processed_topic2}.")
+                print("This might be normal if input topics are empty or Spark is still initializing.")
+                print("Continuing with consumer setup...")
+    except Exception as e:
+        print(f"Error verifying Spark output: {e}")
+        print("Continuing with consumer setup...")
+    
+    # ChromaDB setup verification
+    try:
+        print("Final ChromaDB setup verification...")
+        if not check_chromadb_setup():
+            print("ChromaDB setup is not correct. Please check the installation and configuration.")
+            return
+    except Exception as e:
+        print(f"Error checking ChromaDB setup: {e}")
+        return
+    
     thread_0, thread_1 = start_threads(consumer_00, consumer_01)
     print("Threads started for processing messages.")
 
