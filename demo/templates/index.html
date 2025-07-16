@@ -357,8 +357,10 @@
             }
 
             function updateButtons() {
+                console.log('updateButtons called:', { cam1: uploads.cam1, cam2: uploads.cam2, processing: processing });
                 startBtn.disabled = !(uploads.cam1 && uploads.cam2) || processing;
                 stopBtn.disabled = !processing;
+                logMessage(`Button states - Start: ${startBtn.disabled ? 'disabled' : 'enabled'}, Stop: ${stopBtn.disabled ? 'disabled' : 'enabled'}`);
             }
 
             // --- WEBSOCKET ---
@@ -414,9 +416,6 @@
 
             // --- API CALLS ---
             async function fetchLatestMatches() {
-                // Always fetch matches even if not processing, to show test images
-                // if (!processing) return;
-
                 try {
                     const response = await fetch(`${API_BASE_URL}/latest_matches`);
                     if (!response.ok) {
@@ -426,37 +425,31 @@
                     const data = await response.json();
                     
                     if (data.matches && data.matches.length > 0) {
-                        logMessage(`Found ${data.matches.length} matches from server`);
+                        logMessage(`Found ${data.matches.length} vehicle matches from server`);
                         console.log("Matches data:", data.matches);
                         
-                        // Group matches by camera
-                        const cam1Matches = data.matches.filter(match => match.filename.includes('cam1'));
-                        const cam2Matches = data.matches.filter(match => match.filename.includes('cam2'));
+                        // The new API returns matches grouped by vehicle_id with cam1 and cam2 objects
+                        // Convert to the format expected by the UI
+                        const vehiclePairs = new Map();
                         
-                        logMessage(`Camera 1 matches: ${cam1Matches.length}, Camera 2 matches: ${cam2Matches.length}`);
+                        data.matches.forEach(match => {
+                            const vehicleId = match.vehicle_id;
+                            
+                            // Create a vehicle pair entry
+                            vehiclePairs.set(vehicleId, {
+                                cam1: match.cam1,
+                                cam2: match.cam2,
+                                timestamp: match.timestamp
+                            });
+                        });
                         
-                        // For test images, if no cam1/cam2 prefixes found, assign them manually
-                        if (cam1Matches.length === 0 && cam2Matches.length === 0 && data.matches.length > 0) {
-                            logMessage("No camera prefixes found in filenames, assigning manually");
-                            // Assign first image to cam1, second to cam2
-                            if (data.matches.length >= 1) {
-                                const match1 = {...data.matches[0]};
-                                match1.filename = `cam1_${match1.filename}`;
-                                cam1Matches.push(match1);
-                            }
-                            if (data.matches.length >= 2) {
-                                const match2 = {...data.matches[1]};
-                                match2.filename = `cam2_${match2.filename}`;
-                                cam2Matches.push(match2);
-                            }
-                            logMessage(`Assigned manually - Camera 1: ${cam1Matches.length}, Camera 2: ${cam2Matches.length}`);
-                        }
-                        
-                        // Extract vehicle IDs from filenames and pair the matches
-                        const vehiclePairs = createVehiclePairs(cam1Matches, cam2Matches);
+                        logMessage(`Created ${vehiclePairs.size} vehicle pairs`);
                         
                         // Update the UI with the matched pairs
                         updateMatchedPairsDisplay(vehiclePairs);
+                    } else {
+                        logMessage('No matches found from server');
+                        updateMatchedPairsDisplay(new Map());
                     }
                 } catch (error) {
                     console.error('Error fetching latest matches:', error);
@@ -465,57 +458,7 @@
             }
             
             // Function to create vehicle pairs from camera matches
-            function createVehiclePairs(cam1Matches, cam2Matches) {
-                // Map to store pairs by vehicle ID
-                const vehiclePairs = new Map();
-                
-                // Helper function to extract vehicle ID from filename
-                const getVehicleId = (filename) => {
-                    // Try to extract vehicle ID from filename
-                    // This regex pattern looks for "vehicle_123" or similar patterns
-                    const match = filename.match(/vehicle[_-](\d+)|track[_-](\d+)/i);
-                    if (match) {
-                        return match[1] || match[2];
-                    }
-                    
-                    // For test images that don't have a standard vehicle ID format
-                    // Just use the first part of the filename as the ID
-                    const testImageMatch = filename.match(/cam\d+_(.+)\.jpg$/i);
-                    if (testImageMatch) {
-                        // Return first 8 chars of filename to use as ID
-                        return testImageMatch[1].substring(0, 8);
-                    }
-                    
-                    // If no ID can be extracted, use a part of the filename
-                    return filename.replace(/\.[^/.]+$/, "").substring(0, 8); // Remove extension and limit length
-                };
-                
-                // Process camera 1 matches
-                cam1Matches.forEach(match => {
-                    const id = getVehicleId(match.filename);
-                    if (id) {
-                        if (!vehiclePairs.has(id)) {
-                            vehiclePairs.set(id, { cam1: match, cam2: null });
-                        } else {
-                            vehiclePairs.get(id).cam1 = match;
-                        }
-                    }
-                });
-                
-                // Process camera 2 matches and pair with camera 1 matches
-                cam2Matches.forEach(match => {
-                    const id = getVehicleId(match.filename);
-                    if (id) {
-                        if (!vehiclePairs.has(id)) {
-                            vehiclePairs.set(id, { cam1: null, cam2: match });
-                        } else {
-                            vehiclePairs.get(id).cam2 = match;
-                        }
-                    }
-                });
-                
-                return vehiclePairs;
-            }
+            // createVehiclePairs function is no longer needed - the new API provides properly paired matches
             
             // Function to update the UI with matched vehicle pairs
             function updateMatchedPairsDisplay(vehiclePairs) {
@@ -534,9 +477,6 @@
                 // Hide the "no matches" message and prepare to display pairs
                 noMatchesPairsText.style.display = 'none';
                 matchedPairsContainer.innerHTML = '';
-                
-                // Force processing to true to ensure images are visible for test images
-                processing = true;
                 
                 // Convert the map to an array and sort by ID for consistent display
                 const sortedPairs = Array.from(vehiclePairs.entries())
@@ -583,17 +523,16 @@
                 
                 if (pair.cam1) {
                     const img1 = document.createElement('img');
-                    const baseUrl = pair.cam1.small_thumbnail_url || pair.cam1.thumbnail_url || pair.cam1.path;
-                    const separator = baseUrl.includes('?') ? '&' : '?';
+                    const imageUrl = `${API_BASE_URL}/matching_resized/${vehicleId}/${pair.cam1.filename}`;
                     
                     // Log the image URL for debugging
-                    console.log(`Camera 1 image URL: ${API_BASE_URL}${baseUrl}${separator}t=${new Date().getTime()}`);
+                    console.log(`Camera 1 image URL: ${imageUrl}`);
                     logMessage(`Loading Camera 1 image: ${pair.cam1.filename}`);
                     
-                    img1.src = `${API_BASE_URL}${baseUrl}${separator}t=${new Date().getTime()}`;
+                    img1.src = imageUrl;
                     img1.alt = 'Vehicle from Camera 1';
                     img1.className = 'matched-vehicle-img cursor-pointer';
-                    img1.title = `${pair.cam1.filename}\n${new Date(pair.cam1.timestamp).toLocaleTimeString()}`;
+                    img1.title = `${pair.cam1.filename}\nTrack ID: ${pair.cam1.track_id}`;
                     
                     // Add error handler for image loading
                     img1.onerror = (e) => {
@@ -609,18 +548,16 @@
                     };
                     
                     img1.addEventListener('click', () => {
-                        showFullSizeImage(pair.cam1.path, pair.cam1.filename);
+                        showFullSizeImage(`/matching_resized/${vehicleId}/${pair.cam1.filename}`, pair.cam1.filename);
                     });
                     
                     cam1Container.appendChild(img1);
                     
-                    // Show timestamp if available
-                    if (pair.cam1.timestamp) {
-                        const time = document.createElement('div');
-                        time.className = 'text-xs text-gray-500 mt-1';
-                        time.textContent = new Date(pair.cam1.timestamp).toLocaleTimeString();
-                        cam1Container.appendChild(time);
-                    }
+                    // Show track ID info
+                    const trackInfo = document.createElement('div');
+                    trackInfo.className = 'text-xs text-gray-500 mt-1';
+                    trackInfo.textContent = `Track ID: ${pair.cam1.track_id}`;
+                    cam1Container.appendChild(trackInfo);
                 } else {
                     // Placeholder if no image for camera 1
                     const placeholder = document.createElement('div');
@@ -648,17 +585,16 @@
                 
                 if (pair.cam2) {
                     const img2 = document.createElement('img');
-                    const baseUrl = pair.cam2.small_thumbnail_url || pair.cam2.thumbnail_url || pair.cam2.path;
-                    const separator = baseUrl.includes('?') ? '&' : '?';
+                    const imageUrl = `${API_BASE_URL}/matching_resized/${vehicleId}/${pair.cam2.filename}`;
                     
                     // Log the image URL for debugging
-                    console.log(`Camera 2 image URL: ${API_BASE_URL}${baseUrl}${separator}t=${new Date().getTime()}`);
+                    console.log(`Camera 2 image URL: ${imageUrl}`);
                     logMessage(`Loading Camera 2 image: ${pair.cam2.filename}`);
                     
-                    img2.src = `${API_BASE_URL}${baseUrl}${separator}t=${new Date().getTime()}`;
+                    img2.src = imageUrl;
                     img2.alt = 'Vehicle from Camera 2';
                     img2.className = 'matched-vehicle-img cursor-pointer';
-                    img2.title = `${pair.cam2.filename}\n${new Date(pair.cam2.timestamp).toLocaleTimeString()}`;
+                    img2.title = `${pair.cam2.filename}\nTrack ID: ${pair.cam2.track_id}`;
                     
                     // Add error handler for image loading
                     img2.onerror = (e) => {
@@ -674,18 +610,16 @@
                     };
                     
                     img2.addEventListener('click', () => {
-                        showFullSizeImage(pair.cam2.path, pair.cam2.filename);
+                        showFullSizeImage(`/matching_resized/${vehicleId}/${pair.cam2.filename}`, pair.cam2.filename);
                     });
                     
                     cam2Container.appendChild(img2);
                     
-                    // Show timestamp if available
-                    if (pair.cam2.timestamp) {
-                        const time = document.createElement('div');
-                        time.className = 'text-xs text-gray-500 mt-1';
-                        time.textContent = new Date(pair.cam2.timestamp).toLocaleTimeString();
-                        cam2Container.appendChild(time);
-                    }
+                    // Show track ID info
+                    const trackInfo = document.createElement('div');
+                    trackInfo.className = 'text-xs text-gray-500 mt-1';
+                    trackInfo.textContent = `Track ID: ${pair.cam2.track_id}`;
+                    cam2Container.appendChild(trackInfo);
                 } else {
                     // Placeholder if no image for camera 2
                     const placeholder = document.createElement('div');
@@ -741,8 +675,7 @@
                 // Set image and show modal
                 const modalImage = document.getElementById('modalImage');
                 const modalTitle = document.getElementById('modalTitle');
-                const separator = imagePath.includes('?') ? '&' : '?';
-                modalImage.src = `${API_BASE_URL}${imagePath}${separator}t=${new Date().getTime()}`;
+                modalImage.src = `${API_BASE_URL}${imagePath}`;
                 modalTitle.textContent = filename;
                 modal.classList.remove('hidden');
             }
@@ -797,6 +730,7 @@
                     showNotification(`${file.name} uploaded successfully.`, 'success');
                     
                     uploads[camera] = true;
+                    console.log('Upload successful, uploads object:', uploads);
                     updateButtons();
                 } catch (error) {
                     console.error(`Upload error for ${camera}:`, error);
@@ -907,3 +841,5 @@
     </script>
 </body>
 </html>
+
+
