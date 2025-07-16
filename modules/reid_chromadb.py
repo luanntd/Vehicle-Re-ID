@@ -15,17 +15,7 @@ class ChromaDBVehicleReID:
     def __init__(self, 
                  db_path: str = "./chroma_vehicle_reid", 
                  collection_name: str = "vehicle_embeddings"):
-        """
-        Initialize the ChromaDB-based vehicle re-identification system.
-        
-        Parameters
-        ----------
-        db_path: str
-            Path to ChromaDB database directory
-        collection_name: str
-            Name of the ChromaDB collection
-        """
-        # Confidence thresholds for different scenarios
+
         self.CONFIDENCE_THRESHOLD = {
             'high': 0.95,    # For very confident matches
             'normal': 0.85,  # For regular matches
@@ -70,7 +60,6 @@ class ChromaDBVehicleReID:
         self.current_max_ids = self._load_max_ids()
     
     def _load_max_ids(self) -> Dict[int, int]:
-        """Load current maximum IDs for each vehicle type from database."""
         max_ids = {}
         for vehicle_type_id in self.VEHICLE_TYPES.keys():
             collection = self.collections[vehicle_type_id]
@@ -89,12 +78,10 @@ class ChromaDBVehicleReID:
         return max_ids
     
     def _encode_image(self, image: np.ndarray) -> str:
-        """Encode image to base64 string for storage."""
         _, buffer = cv2.imencode('.jpg', image)
         return base64.b64encode(buffer).decode('utf-8')
     
     def _decode_image(self, encoded_image: str) -> np.ndarray:
-        """Decode base64 string back to image."""
         image_data = base64.b64decode(encoded_image)
         nparr = np.frombuffer(image_data, np.uint8)
         return cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -103,22 +90,6 @@ class ChromaDBVehicleReID:
                            target: torch.Tensor, 
                            vehicle_type: int,
                            top_k: int = 50) -> Tuple[List[float], List[Dict]]:
-        """
-        Calculate similarity between target and stored embeddings.
-        
-        Parameters
-        ----------
-        target: torch.Tensor
-            Target embedding vector
-        vehicle_type: int
-            Vehicle type (0: motorcycle, 1: car, 2: truck, 3: bus)
-        top_k: int
-            Number of top similar embeddings to return
-            
-        Returns
-        -------
-        Tuple[List[float], List[Dict]]: Similarities and metadata
-        """
         collection = self.collections[vehicle_type]
         
         # Convert tensor to list for ChromaDB
@@ -136,7 +107,6 @@ class ChromaDBVehicleReID:
                 return [], []
             
             # Convert distances to similarities (ChromaDB returns cosine distances)
-            # Cosine similarity = 1 - cosine distance
             similarities = [1 - dist for dist in results['distances'][0]]
             metadatas = results['metadatas'][0]
             
@@ -155,32 +125,6 @@ class ChromaDBVehicleReID:
                 camera_id: Optional[str] = None,
                 track_id: Optional[int] = None,
                 timestamp: Optional[str] = None) -> int:
-        """
-        Identify a vehicle based on its features.
-        
-        Parameters
-        ----------
-        target: torch.Tensor
-            Feature vector of the vehicle to identify
-        vehicle_type: int
-            Class index of the vehicle (0: motorcycle, 1: car, 2: truck, 3: bus)
-        confidence: float
-            Detection confidence from YOLO
-        do_update: bool
-            Whether to update the embeddings database
-        image: np.ndarray, optional
-            Vehicle image for storage
-        camera_id: str, optional
-            Camera identifier
-        track_id: int, optional
-            Track ID from YOLO
-        timestamp: str, optional
-            Timestamp of detection
-            
-        Returns
-        -------
-        int: Unique ID for the vehicle
-        """
         # Default to new ID
         target_id = self.current_max_ids[vehicle_type]
         
@@ -202,7 +146,6 @@ class ChromaDBVehicleReID:
             # If good match found, use existing ID
             if best_similarity > threshold:
                 target_id = int(metadatas[best_idx]['vehicle_id'])
-                # print(f"Matched existing vehicle ID: {target_id} (similarity: {best_similarity:.3f})")
         
         # Update database if requested
         if do_update:
@@ -232,18 +175,15 @@ class ChromaDBVehicleReID:
                       camera_id: Optional[str] = None,
                       track_id: Optional[int] = None,
                       timestamp: Optional[str] = None):
-        """Add embedding and metadata to ChromaDB."""
         collection = self.collections[vehicle_type]
         
         # Normalize parameters to avoid None values
         camera_id = camera_id or 'unknown'
         track_id = track_id or -1
         
-        # Check if a vehicle with the same vehicle_id, camera_id and track_id already exists
-        # Only skip if both camera_id and track_id are valid values
+        # Check if a vehicle with the same vehicle_id, camera_id already exists
         if camera_id != 'unknown' and track_id != -1:
             try:
-                # Using proper operator format for ChromaDB where clause
                 where_clause = {
                     "$and": [
                         {"vehicle_id": {"$eq": vehicle_id}},
@@ -252,15 +192,10 @@ class ChromaDBVehicleReID:
                 }
                 
                 existing_records = collection.get(where=where_clause)
-                
-                # If this exact camera/track combination already exists for this vehicle_id,
-                # don't add another duplicate record
                 if existing_records and len(existing_records['ids']) > 0:
-                    # print(f"Skipping duplicate for vehicle_id={vehicle_id}, camera={camera_id}, track={track_id}")
                     return
             except Exception as e:
                 print(f"Error checking for existing records: {e}")
-                # Continue with adding the embedding even if checking fails
         
         # Generate unique document ID
         doc_id = str(uuid.uuid4())
@@ -291,29 +226,14 @@ class ChromaDBVehicleReID:
                 metadatas=[metadata],
                 ids=[doc_id]
             )
-            # print(f"Added embedding for vehicle ID {vehicle_id} to database")
+
         except Exception as e:
             print(f"Error adding embedding to database: {e}")
     
     def get_vehicle_history(self, vehicle_id: int, vehicle_type: int) -> List[Dict]:
-        """
-        Get all stored data for a specific vehicle ID.
-        
-        Parameters
-        ----------
-        vehicle_id: int
-            Vehicle ID to search for
-        vehicle_type: int
-            Vehicle type
-            
-        Returns
-        -------
-        List[Dict]: All records for the vehicle
-        """
         collection = self.collections[vehicle_type]
         
         try:
-            # Use proper operator format for ChromaDB where clause
             where_clause = {"vehicle_id": {"$eq": vehicle_id}}
             
             results = collection.get(
@@ -339,20 +259,6 @@ class ChromaDBVehicleReID:
             return []
     
     def get_cross_camera_matches(self, vehicle_id: int, vehicle_type: int) -> Dict[str, List[Dict]]:
-        """
-        Get all camera appearances for a vehicle ID.
-        
-        Parameters
-        ----------
-        vehicle_id: int
-            Vehicle ID to search for
-        vehicle_type: int
-            Vehicle type
-            
-        Returns
-        -------
-        Dict[str, List[Dict]]: Camera ID -> List of appearances
-        """
         history = self.get_vehicle_history(vehicle_id, vehicle_type)
         
         # Group by camera
@@ -367,47 +273,26 @@ class ChromaDBVehicleReID:
     
     def save_cross_camera_images(self, 
                                 vehicle_id: int, 
-                                vehicle_type: int, 
+                                vehicle_type: int,
+                                camera_matches, 
                                 save_dir: str = "matching"):
-        """
-        Save images of vehicles that appear across multiple cameras.
         
-        Parameters
-        ----------
-        vehicle_id: int
-            Vehicle ID
-        vehicle_type: int
-            Vehicle type
-        save_dir: str
-            Directory to save images
-        """
-        camera_matches = self.get_cross_camera_matches(vehicle_id, vehicle_type)
+        vehicle_type_name = self.VEHICLE_TYPES[vehicle_type]
+        vehicle_dir = f'{vehicle_type_name}_{vehicle_id}'
+        match_dir = os.path.join(save_dir, vehicle_dir)
         
-        if len(camera_matches) > 1:
-            vehicle_type_name = self.VEHICLE_TYPES[vehicle_type]
-            vehicle_dir = f'{vehicle_type_name}_{vehicle_id}'
-            match_dir = os.path.join(save_dir, vehicle_dir)
-            
-            if not os.path.exists(match_dir):
-                os.makedirs(match_dir)
-            
-            # Save one image per unique track_id per camera
-            for camera_id, records in camera_matches.items():
-                saved_tracks = set()
-                for record in records:
-                    track_id = record['track_id']
-                    key = (camera_id, track_id)
-                    
-                    if key not in saved_tracks and 'image' in record:
-                        filename = f"{camera_id}_track{track_id}.jpg"
-                        filepath = os.path.join(match_dir, filename)
-                        cv2.imwrite(filepath, record['image'])
-                        saved_tracks.add(key)
-            
-            print(f"Saved cross-camera images for vehicle {vehicle_id} in {match_dir}")
+        if not os.path.exists(match_dir):
+            os.makedirs(match_dir)
+        
+        # Save one image per unique track_id per camera
+        for camera_id, records in camera_matches.items():
+            for record in records:
+                track_id = record['track_id']
+                filename = f"{camera_id}_track{track_id}.jpg"
+                filepath = os.path.join(match_dir, filename)
+                cv2.imwrite(filepath, record['image'])
     
     def get_statistics(self) -> Dict:
-        """Get database statistics."""
         stats = {}
         total_embeddings = 0
         
@@ -423,7 +308,6 @@ class ChromaDBVehicleReID:
         return stats
     
     def reset_database(self):
-        """Reset the entire database - use with caution!"""
         for vehicle_type_id in self.VEHICLE_TYPES.keys():
             collection = self.collections[vehicle_type_id]
             # Delete all documents
@@ -434,9 +318,3 @@ class ChromaDBVehicleReID:
         # Reset max IDs
         self.current_max_ids = {k: 0 for k in self.VEHICLE_TYPES.keys()}
         print("Database reset completed")
-    
-    def close(self):
-        """Close database connection."""
-        # ChromaDB client doesn't need explicit closing
-        # Data is automatically persisted
-        print("ChromaDB connection closed")

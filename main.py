@@ -1,32 +1,16 @@
 import cv2
 import os
 import gc
-from realtime_reid.vehicle_detector import VehicleDetector
-from realtime_reid.feature_extraction import VehicleDescriptor
-from realtime_reid.classifier_chromadb import ChromaDBVehicleReID
-from realtime_reid.pipeline import Pipeline
+from modules.vehicle_detection import VehicleDetector
+from modules.feature_extraction import VehicleDescriptor
+from modules.reid_chromadb import ChromaDBVehicleReID
+from modules.pipeline import Pipeline
 
-def run_reid_on_two_videos_chromadb(video_path1, video_path2, 
+def run_reid(video_path1, video_path2, 
                                    save_dir=None, 
                                    db_path="./chroma_vehicle_reid",
                                    process_every_n_frames=5,
                                    reset_database=False):
-    """
-    Run vehicle re-identification on two video streams using ChromaDB.
-    
-    Parameters:
-    -----------
-    video_path1, video_path2: str
-        Paths to input video files
-    save_dir: str, optional
-        Directory to save output videos
-    db_path: str
-        Path to ChromaDB database
-    process_every_n_frames: int, default=5
-        Process every N-th frame to reduce computational load
-    reset_database: bool
-        Whether to reset the database before processing
-    """
     # Initialize components with ChromaDB
     detector = VehicleDetector(model_path='checkpoints/best_20.pt')
     descriptor = VehicleDescriptor(model_type='osnet', model_path='checkpoints/best_osnet_model.pth')
@@ -42,8 +26,8 @@ def run_reid_on_two_videos_chromadb(video_path1, video_path2,
     stats = classifier.get_statistics()
     for vehicle_type, count in stats.items():
         if vehicle_type not in ['total', 'max_ids']:
-            print(f"  {vehicle_type}: {count} embeddings")
-    print(f"  Total: {stats['total']} embeddings")
+            print(f"{vehicle_type}: {count} embeddings")
+    print(f"Total: {stats['total']} embeddings")
     
     pipeline = Pipeline(detector=detector, descriptor=descriptor, classifier=classifier)
     
@@ -58,7 +42,7 @@ def run_reid_on_two_videos_chromadb(video_path1, video_path2,
     width2 = int(cap2.get(cv2.CAP_PROP_FRAME_WIDTH))
     height2 = int(cap2.get(cv2.CAP_PROP_FRAME_HEIGHT))
     
-    # Resize frames if they're too large to save memory
+    # Resize frames
     max_width = 1920
     max_height = 1080
     
@@ -97,14 +81,13 @@ def run_reid_on_two_videos_chromadb(video_path1, video_path2,
             if not ret1 and not ret2:
                 break
                 
-            # Process every N-th frame to reduce memory usage
             if frame_count % process_every_n_frames == 0:
                 if ret1:
                     # Resize frame if needed
                     if resize1:
                         frame1 = cv2.resize(frame1, (width1, height1))
                     
-                    # Process frame with ChromaDB pipeline
+                    # Process frame
                     result1 = pipeline.process(frame1, 'cam1')
                     if save_dir and result1 is not None:
                         out1.write(result1)
@@ -117,7 +100,7 @@ def run_reid_on_two_videos_chromadb(video_path1, video_path2,
                     if resize2:
                         frame2 = cv2.resize(frame2, (width2, height2))
                     
-                    # Process frame with ChromaDB pipeline
+                    # Process frame
                     result2 = pipeline.process(frame2, 'cam2')
                     if save_dir and result2 is not None:
                         out2.write(result2)
@@ -128,7 +111,6 @@ def run_reid_on_two_videos_chromadb(video_path1, video_path2,
                 # Force garbage collection every 100 frames
                 if frame_count % 100 == 0:
                     gc.collect()
-                    # Print progress and database stats
                     if frame_count % 500 == 0:
                         print(f"Processed {frame_count} frames")
                         current_stats = classifier.get_statistics()
@@ -153,14 +135,13 @@ def run_reid_on_two_videos_chromadb(video_path1, video_path2,
         for vehicle_type, count in final_stats.items():
             if vehicle_type not in ['total', 'max_ids']:
                 print(f"  {vehicle_type}: {count} embeddings")
-        print(f"  Total: {final_stats['total']} embeddings")
-        print(f"  Max IDs: {final_stats['max_ids']}")
+        print(f"Total: {final_stats['total']} embeddings")
+        print(f"Max IDs: {final_stats['max_ids']}")
         
         # Close pipeline
         pipeline.close()
 
 if __name__ == "__main__":
-    # Set your video paths and output directory here
     video1 = "data/cam1.mp4"
     video2 = "data/cam2_full.mp4"
     output_dir = "results"
@@ -168,7 +149,7 @@ if __name__ == "__main__":
         os.makedirs(output_dir)
     
     # Run with memory optimization settings
-    run_reid_on_two_videos_chromadb(
+    run_reid(
         video1, 
         video2, 
         save_dir=output_dir,

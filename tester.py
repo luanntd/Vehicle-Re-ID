@@ -1,20 +1,19 @@
 import os
 import torch
 import numpy as np
-import json
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from tqdm import tqdm
 
 from utils.dataset import VehicleReIDDataset
 from utils.compute_metrics import compute_cmc_map, compute_classification_metrics
-from realtime_reid.feature_extraction import VehicleDescriptor
+from modules.feature_extraction import VehicleDescriptor
 
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def test_reid(model, loader, args):
+def test(model, loader, args):
     """Test feature extraction + similarity ranking with comprehensive metrics using cosine similarity
     """
     print("\n=== Testing Feature Extraction + Similarity Ranking ===")
@@ -154,7 +153,7 @@ def main():
     model.eval()
 
     # Run feature extraction test
-    results = test_reid(model, loader, args)
+    results = test(model, loader, args)
     
     # Save results if requested
     if args.save_results:

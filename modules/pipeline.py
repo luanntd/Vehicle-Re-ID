@@ -13,7 +13,7 @@ class Pipeline:
                 descriptor: VehicleDescriptor = None,
                 classifier: ChromaDBVehicleReID = None,
                 db_path: str = "./chroma_vehicle_reid") -> None:
-        """Initialize the pipeline with vehicle detection and re-identification components."""
+
         self.detector = detector or VehicleDetector()
         self.descriptor = descriptor or VehicleDescriptor(model_type='osnet')
         self.classifier = classifier or ChromaDBVehicleReID(db_path=db_path)
@@ -22,22 +22,6 @@ class Pipeline:
         self.processed_cross_camera = set()
 
     def process(self, frame, camera_id, save_cross_camera_images=True):
-        """
-        Process a frame directly without encoding/decoding to save memory.
-        
-        Parameters
-        ----------
-        frame: np.ndarray
-            OpenCV frame (BGR format)
-        camera_id: str
-            Camera identifier
-        save_cross_camera_images: bool
-            Whether to save cross-camera matching images
-            
-        Returns
-        -------
-        np.ndarray: Processed frame with bounding boxes and vehicle IDs
-        """
         try:
             VEHICLE_LABELS = {0: 'motorcycle', 1: 'car', 2: 'truck', 3: 'bus'}
             
@@ -87,19 +71,14 @@ class Pipeline:
                 
                 # Check for cross-camera matches and save images
                 if save_cross_camera_images:
-                    # Always check for cross-camera matches (not just for new vehicles)
                     camera_matches = self.classifier.get_cross_camera_matches(vehicle_id, cls)
                     if len(camera_matches) > 1:
-                        # Use (camera_id, track_id) as key to ensure uniqueness per camera/track combination
-                        # This prevents duplicate image saving for the same track in a camera
                         vehicle_key = (camera_id, vehicle_id)
                         print(f"CROSS-CAMERA MATCH! Vehicle ID: {vehicle_id} ({VEHICLE_LABELS.get(cls, f'class_{cls}')}) found in cameras: {list(camera_matches.keys())}")
                         
-                        # Only save images once per camera/track combination to avoid duplicates
                         if vehicle_key not in self.processed_cross_camera:
-                            self.classifier.save_cross_camera_images(vehicle_id, cls)
+                            self.classifier.save_cross_camera_images(vehicle_id, cls, camera_matches)
                             self.processed_cross_camera.add(vehicle_key)
-                            # print(f"📸 Saved cross-camera images for vehicle {vehicle_id} (camera {camera_id}, track {track_id})")
 
                 # Create label with vehicle ID and type
                 vehicle_type = VEHICLE_LABELS.get(cls, f'class_{cls}')
@@ -136,88 +115,14 @@ class Pipeline:
     
     def save_vehicle_database(self):
         """Save the current state of the vehicle database."""
-        # ChromaDB automatically persists data, but we can get stats
         stats = self.get_pipeline_statistics()
         print("Current database statistics:")
         for vehicle_type, count in stats.items():
             if vehicle_type != 'total' and vehicle_type != 'max_ids':
                 print(f"  {vehicle_type}: {count} embeddings")
-        print(f"  Total: {stats['total']} embeddings")
+        print(f"Total: {stats['total']} embeddings")
         
     def close(self):
         """Close pipeline and database connections."""
         self.classifier.close()
         print("Pipeline closed successfully")
-
-# Utility function for Spark integration
-def create_spark_compatible_pipeline(db_path: str = "./chroma_vehicle_reid"):
-    """
-    Create a pipeline instance that's compatible with Spark serialization.
-    
-    Parameters
-    ----------
-    db_path: str
-        Path to ChromaDB database
-        
-    Returns
-    -------
-    Pipeline: Configured pipeline instance
-    """
-    detector = VehicleDetector(model_path='checkpoints/best_20.pt')
-    descriptor = VehicleDescriptor(
-        model_type='osnet', 
-        model_path='checkpoints/best_osnet_model.pth'
-    )
-    classifier = ChromaDBVehicleReID(db_path=db_path)
-    
-    return Pipeline(
-        detector=detector,
-        descriptor=descriptor,
-        classifier=classifier,
-        db_path=db_path
-    )
-
-# Function for processing frames in Spark
-def process_frame_spark(frame_data, camera_id, db_path="./chroma_vehicle_reid"):
-    """
-    Process a single frame in Spark context.
-    This function creates its own pipeline instance to avoid serialization issues.
-    
-    Parameters
-    ----------
-    frame_data: bytes or np.ndarray
-        Frame data
-    camera_id: str
-        Camera identifier
-    db_path: str
-        Path to ChromaDB database
-        
-    Returns
-    -------
-    np.ndarray: Processed frame
-    """
-    # Create pipeline instance for this Spark task
-    pipeline = create_spark_compatible_pipeline(db_path)
-    
-    try:
-        # Convert bytes to frame if needed
-        if isinstance(frame_data, bytes):
-            frame = cv2.imdecode(
-                np.frombuffer(frame_data, dtype=np.uint8),
-                cv2.IMREAD_COLOR
-            )
-        else:
-            frame = frame_data
-        
-        # Process frame
-        result = pipeline.process(frame, camera_id)
-        
-        # Close pipeline
-        pipeline.close()
-        
-        return result
-        
-    except Exception as e:
-        print(f"Error in Spark frame processing: {e}")
-        pipeline.close()
-        return frame_data if isinstance(frame_data, np.ndarray) else None

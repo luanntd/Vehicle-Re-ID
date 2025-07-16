@@ -7,10 +7,6 @@ import torch.nn.functional as F
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class OSNet(nn.Module):
-    """
-    Omni-Scale Network for Vehicle Re-ID
-    State-of-the-art architecture for re-identification tasks
-    """
     def __init__(self, num_classes=1000, feature_dim=512):
         super(OSNet, self).__init__()
         
@@ -61,10 +57,6 @@ class OSNet(nn.Module):
             return feat
 
 class ResNetIBN(nn.Module):
-    """
-    ResNet with Instance-Batch Normalization
-    Better for domain adaptation across different cameras
-    """
     def __init__(self, num_classes=1000, feature_dim=2048):
         super(ResNetIBN, self).__init__()
         
@@ -173,7 +165,6 @@ class VehicleDescriptor:
         ])
 
     def _create_efficientnet_model(self, feature_dim):
-        """Create EfficientNet-based model for vehicle re-ID"""
         model = models.efficientnet_b3(weights=models.EfficientNet_B3_Weights.DEFAULT)
         
         # Replace classifier
@@ -187,7 +178,6 @@ class VehicleDescriptor:
         return model
     
     def _load_model_weights(self, model_path):
-        """Load model weights with error handling"""
         try:
             if self.model_type == 'efficientnet':
                 # For EfficientNet, load full state dict
@@ -214,24 +204,7 @@ class VehicleDescriptor:
             print(f"Warning: Could not load model weights from {model_path}: {e}")
             print("Using default pretrained weights")
 
-    def extract_feature(self, input_img: np.ndarray, use_tta=False) -> torch.Tensor:
-        """
-        Extract features from a vehicle image.
-        
-        Parameters
-        ----------
-        input_img: np.ndarray
-            The vehicle image to extract features from
-        use_tta: bool
-            Whether to use Test Time Augmentation for better features
-            
-        Returns
-        -------
-        torch.Tensor: Feature vector representing the vehicle
-        """
-        if use_tta:
-            return self._extract_feature_with_tta(input_img)
-        
+    def extract_feature(self, input_img: np.ndarray) -> torch.Tensor:        
         # Preprocess image
         img = self.transforms(input_img).unsqueeze(0)
         img = img.to(device)
@@ -253,35 +226,6 @@ class VehicleDescriptor:
         features = F.normalize(features, p=2, dim=0)
         
         return features
-    
-    def _extract_feature_with_tta(self, input_img: np.ndarray) -> torch.Tensor:
-        """Extract features using Test Time Augmentation"""
-        # Original image
-        features_list = []
-        
-        # Original
-        img = self.transforms(input_img).unsqueeze(0).to(device)
-        with torch.no_grad():
-            feat = self.model(img)
-            if isinstance(feat, tuple):
-                feat = feat[0]
-            features_list.append(feat.squeeze())
-        
-        # Horizontal flip
-        img_flip = torch.flip(img, dims=[3])
-        with torch.no_grad():
-            feat_flip = self.model(img_flip)
-            if isinstance(feat_flip, tuple):
-                feat_flip = feat_flip[0]
-            features_list.append(feat_flip.squeeze())
-        
-        # Average features
-        features = torch.stack(features_list).mean(dim=0)
-        
-        # Normalize
-        features = F.normalize(features, p=2, dim=0)
-        
-        return features
 
     def get_model_info(self):
         """Get information about the current model"""
@@ -296,8 +240,7 @@ class VehicleDescriptor:
 # Example usage and model factory
 def create_vehicle_descriptor(model_type='osnet', model_path=None, input_size=(256, 256), num_classes=1000):
     """
-    Factory function to create VehicleDescriptor with different models
-    
+    Factory function to create VehicleDescriptor with different models    
     Available pretrained models:
     - OSNet: Best for vehicle re-ID, handles scale variations well
     - ResNet-IBN: Good for cross-camera scenarios

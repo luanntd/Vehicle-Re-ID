@@ -12,11 +12,11 @@ import argparse
 from utils.dataset import VehicleReIDDataset
 from utils.losses import TripletLoss, CenterLoss
 from utils.compute_metrics import compute_mAP
-from realtime_reid.feature_extraction import OSNet, ResNetIBN, create_vehicle_descriptor
+from modules.feature_extraction import OSNet, ResNetIBN, create_vehicle_descriptor
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def train_vehicle_reid_model(
+def train(
     data_dir,
     model_type='osnet',
     num_epochs=120,
@@ -27,34 +27,7 @@ def train_vehicle_reid_model(
     gamma=0.1,
     margin=0.3,
     save_dir='checkpoints'
-):
-    """
-    Train vehicle re-identification model
-    
-    Parameters:
-    -----------
-    data_dir: str
-        Path to dataset directory
-    model_type: str
-        Type of model to train ('osnet', 'resnet_ibn', 'efficientnet')
-    num_epochs: int
-        Number of training epochs
-    batch_size: int
-        Training batch size
-    learning_rate: float
-        Initial learning rate
-    weight_decay: float
-        Weight decay for optimizer
-    step_size: int
-        Step size for learning rate scheduler
-    gamma: float
-        Gamma for learning rate scheduler
-    margin: float
-        Margin for triplet loss
-    save_dir: str
-        Directory to save checkpoints
-    """
-    
+    ):
     # Create save directory
     os.makedirs(save_dir, exist_ok=True)
     
@@ -178,7 +151,7 @@ def train_vehicle_reid_model(
         
         # Validation phase
         if (epoch + 1) % 5 == 0:  # Validate every 5 epochs
-            mAP = evaluate_model(model, val_loader, model_type)
+            mAP = evaluate(model, val_loader, model_type)
             val_mAPs.append(mAP)
             
             print(f'Epoch {epoch+1}: Train Loss = {avg_loss:.4f}, Val mAP = {mAP:.4f}')
@@ -229,7 +202,7 @@ def train_vehicle_reid_model(
     
     print(f'Training completed. Best mAP: {best_mAP:.4f}')
 
-def evaluate_model(model, data_loader, model_type):
+def evaluate(model, data_loader, model_type):
     """Evaluate model on validation set"""
     model.eval()
     
@@ -285,7 +258,7 @@ if __name__ == "__main__":
     
     
     # Train model
-    train_vehicle_reid_model(
+    train(
         data_dir=args.data_dir,
         model_type=args.model_type,
         num_epochs=args.epochs,

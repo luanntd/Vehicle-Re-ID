@@ -5,22 +5,12 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class VehicleReID:
     def __init__(self, from_file: str = None):
-        """
-        Initialize the vehicle re-identification system.
-        
-        Parameters
-        ----------
-        from_file: str, optional
-            Path to load saved embeddings from
-        """
-        # Confidence thresholds for different scenarios
         self.CONFIDENCE_THRESHOLD = {
             'high': 0.95,    # For very confident matches
             'normal': 0.85,  # For regular matches
             'low': 0.75     # For partial/occluded vehicles
         }
         
-        # Initialize embeddings dictionary for different vehicle types
         # Keys are vehicle class indices (0: motorcycle, 1: car, 2: truck, 3: bus)
         self.embeddings = {
             0: torch.Tensor().to(device),  # motorcycles
@@ -58,24 +48,6 @@ class VehicleReID:
         confidence: float = 1.0,
         do_update: bool = False
     ) -> int:
-        """
-        Identify a vehicle based on its features.
-        
-        Parameters
-        ----------
-        target: torch.Tensor
-            Feature vector of the vehicle to identify
-        vehicle_type: int
-            Class index of the vehicle (0: motorcycle, 1: car, 2: truck, 3: bus)
-        confidence: float
-            Detection confidence from YOLO
-        do_update: bool
-            Whether to update the embeddings database
-            
-        Returns
-        -------
-        int: Unique ID for the vehicle
-        """
         # Default to new ID
         target_id = self.current_max_ids[vehicle_type]
         
@@ -118,7 +90,6 @@ class VehicleReID:
         return target_id
 
     def save_embeddings(self, filepath: str):
-        """Save the current embeddings and tracking info to a file."""
         torch.save({
             'embeddings': self.embeddings,
             'ids': self.ids,
