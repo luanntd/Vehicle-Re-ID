@@ -2,9 +2,7 @@ import threading
 import numpy as np
 import cv2
 import findspark
-import os
 import shutil
-from datetime import datetime
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import udf
 from pyspark.sql.types import BinaryType

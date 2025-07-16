@@ -3,6 +3,7 @@ import time
 import cv2
 from kafka import KafkaProducer
 import tqdm
+
 class VideoProducer:
     def __init__(
             self,

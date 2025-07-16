@@ -1,8 +1,6 @@
 import torch
-import torch.nn.functional as F
 import chromadb
 from chromadb.config import Settings
-import chromadb.errors
 import numpy as np
 import cv2
 import os

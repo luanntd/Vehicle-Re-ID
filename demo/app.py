@@ -12,13 +12,11 @@ import threading
 import cv2
 import numpy as np
 from datetime import datetime
-from typing import Dict, List
+from typing import Dict
 import shutil
 from pathlib import Path
 import base64
-import tempfile
 from kafka import KafkaProducer, KafkaConsumer
-from kafka.errors import KafkaError
 from kafka.admin import KafkaAdminClient, NewTopic
 import time
 from queue import Queue
@@ -47,8 +45,8 @@ def ensure_kafka_topic(session_id, bootstrap_servers):
 # Add the parent directory to Python path to import custom modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from streaming.spark_services.spark_streaming import start_spark
-from streaming.kafka_services.producer import VideoProducer
+from vehicle_reid.streaming.spark_streaming import start_spark
+from vehicle_reid.streaming.producer import VideoProducer
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Capture the main event loop on startup."""

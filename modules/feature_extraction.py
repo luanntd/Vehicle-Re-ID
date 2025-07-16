@@ -1,10 +1,8 @@
-import cv2
 import numpy as np
 import torch
 from torch import nn
 from torchvision import transforms, models
 import torch.nn.functional as F
-from collections import OrderedDict
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

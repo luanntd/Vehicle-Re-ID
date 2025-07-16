@@ -316,7 +316,7 @@ def main():
     admin_client.close()
 
     # Start Spark streaming with proper error handling
-    from streaming.spark_services.spark_streaming import start_spark
+    from vehicle_reid.streaming.spark_streaming import start_spark
     spark_thread = None
     try:
         print("Starting Spark streaming...")

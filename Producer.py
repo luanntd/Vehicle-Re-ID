@@ -1,5 +1,5 @@
 import argparse
-from streaming.kafka_services.video_producer import VideoProducer
+from vehicle_reid.streaming.video_producer import VideoProducer
 from kafka.admin import KafkaAdminClient, NewTopic
 
 # Default Kafka bootstrap servers

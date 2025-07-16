@@ -2,10 +2,10 @@ import cv2
 import numpy as np
 from datetime import datetime
 
-from .classifier_chromadb import ChromaDBVehicleReID
+from .reid_chromadb import ChromaDBVehicleReID
 from .feature_extraction import VehicleDescriptor
-from .vehicle_detector import VehicleDetector
-from .visualization_utils import color
+from .vehicle_detection import VehicleDetector
+from ..utils import color
 
 class Pipeline:
     def __init__(self,
