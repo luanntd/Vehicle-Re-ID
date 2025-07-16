@@ -1,5 +1,5 @@
 import argparse
-from streaming.kafka_services.video_producer import VideoProducer
+from streaming.kafka_producer import VideoProducer
 from kafka.admin import KafkaAdminClient, NewTopic
 
 # Default Kafka bootstrap servers
@@ -40,9 +40,13 @@ def main():
     else:
         print(f"Using existing topic: {topic}")
     admin_client.close()
+    
+    # Create producer with batch mode for command-line usage
     producer = VideoProducer(
         topic=args['topic'],
-        interval=args['interval']
+        bootstrap_servers=BOOTSTRAP_SERVERS,
+        interval=args['interval'],
+        mode='batch'
     )
     producer.publish_video(args['camera'])
 
