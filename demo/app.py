@@ -17,9 +17,6 @@ import shutil
 from pathlib import Path
 import base64
 import tempfile
-from kafka import KafkaProducer, KafkaConsumer
-from kafka.errors import KafkaError
-from kafka.admin import KafkaAdminClient, NewTopic
 import time
 from queue import Queue
 import numpy as np
@@ -27,28 +24,15 @@ import numpy as np
 # Global queue for WebSocket messages
 websocket_queue = Queue()
 
-def ensure_kafka_topic(session_id, bootstrap_servers):
-    """Check if a Kafka topic exists, and create it if not."""
-    admin_client = KafkaAdminClient(bootstrap_servers=bootstrap_servers)
-    existing_topics = admin_client.list_topics()
-    topic_names = [f'cam1_{session_id}', f'cam2_{session_id}' ,f'cam1_processed_{session_id}', f'cam2_processed_{session_id}']
-    for topic_name in topic_names:
-        if topic_name not in existing_topics:
-            try:
-                admin_client.create_topics([NewTopic(name=topic_name, num_partitions=1, replication_factor=1)])
-                print(f"Created Kafka topic: {topic_name}")
-            except Exception as e:
-                print(f"Error creating topic {topic_name}: {e}")
-        else:
-            print(f"Kafka topic already exists: {topic_name}")
-            # Return a consumer for the topic
-    admin_client.close()
-
 # Add the parent directory to Python path to import custom modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from streaming.spark_services.spark_streaming import start_spark
-from streaming.kafka_services.producer import VideoProducer
+# Import direct pipeline components (like run_reid.py)
+from realtime_reid.vehicle_detector import VehicleDetector
+from realtime_reid.feature_extraction import VehicleDescriptor
+from realtime_reid.classifier_chromadb import ChromaDBVehicleReID
+from realtime_reid.pipeline import Pipeline
+import gc
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Capture the main event loop on startup."""
@@ -225,139 +209,170 @@ async def process_websocket_queue():
             # In case of an error, sleep a bit before retrying
             await asyncio.sleep(1)
 
-def kafka_consumer_thread(session_id: str, camera: str):
-    """Thread function to consume processed frames from a specific camera"""
-    topic = f'{camera}_processed_{session_id}'
-    print(f"[Kafka Consumer {camera.upper()}] Starting consumer thread for session {session_id}")
+def direct_video_processing_thread(session_id: str):
+    """Process both videos directly using the run_reid pipeline approach"""
+    print(f"[Direct Processing] Starting for session {session_id}")
+    
+    if session_id not in active_sessions:
+        print(f"[Direct Processing] Session {session_id} not found")
+        return
+    
+    session_data = active_sessions[session_id]
     
     try:
-        print(f"[Kafka Consumer {camera.upper()}] Subscribing to topic: {topic}")
+        # Initialize components with ChromaDB (same as run_reid)
+        # Look for model files in the parent directory
+        detector_path = 'best_20.pt'
+        descriptor_path = 'best_osnet_model.pth'
         
-        consumer = KafkaConsumer(
-            topic,
-            bootstrap_servers=['localhost:9092'],    
-            value_deserializer=None,
-            key_deserializer=None,
-            fetch_max_bytes=52428800,       # 50MB
-            max_in_flight_requests_per_connection=5,  # Reduced from 10
-            fetch_max_wait_ms=500,          # Further reduced for responsiveness
-            fetch_min_bytes=1,              
-            consumer_timeout_ms=2000,       # Increased timeout
-            auto_offset_reset='latest',
-            enable_auto_commit=True,
-            auto_commit_interval_ms=1000,   # Auto-commit every second
-            receive_buffer_bytes=67108864,  # 64MB
-            session_timeout_ms=30000,       # Increased session timeout
-            heartbeat_interval_ms=3000,     # Heartbeat every 3 seconds
-            max_poll_records=10,            # Limit records per poll
-            max_poll_interval_ms=300000,    # 5 minutes max poll interval
-            group_id=f'demo_consumer_{camera}_{session_id}_{int(time.time())}'
-        )
+        # Try parent directory if not found in current directory
+        if not os.path.exists(detector_path):
+            detector_path = str(BASE_DIR.parent / 'best_20.pt')
+        if not os.path.exists(descriptor_path):
+            descriptor_path = str(BASE_DIR.parent / 'best_osnet_model.pth')
+            
+        detector = VehicleDetector(model_path=detector_path)
+        descriptor = VehicleDescriptor(model_type='osnet', model_path=descriptor_path)
         
-        print(f"[Kafka Consumer {camera.upper()}] Consumer created successfully for session {session_id}")
+        # Use session-specific database path
+        db_path = f"./chroma_vehicle_reid_streaming/{session_id}"
+        classifier = ChromaDBVehicleReID(db_path=db_path)
         
-        frame_counter = 0
-        last_frame_time = time.time()
-        target_fps = 6.0
+        # Reset database for new session
+        print(f"[Direct Processing] Resetting database for session {session_id}")
+        classifier.reset_database()
+        
+        # Create pipeline (same as run_reid)
+        pipeline = Pipeline(detector=detector, descriptor=descriptor, classifier=classifier)
+        
+        # Open video captures
+        video_path1 = session_data["cameras"]["cam1"]
+        video_path2 = session_data["cameras"]["cam2"]
+        
+        cap1 = cv2.VideoCapture(video_path1)
+        cap2 = cv2.VideoCapture(video_path2)
+        
+        if not cap1.isOpened() or not cap2.isOpened():
+            print(f"[Direct Processing] Error: Could not open video files")
+            return
+        
+        # Get video properties
+        fps1 = int(cap1.get(cv2.CAP_PROP_FPS))
+        fps2 = int(cap2.get(cv2.CAP_PROP_FPS))
+        
+        print(f"[Direct Processing] Video1 FPS: {fps1}, Video2 FPS: {fps2}")
+        
+        # Target processing rate (6 FPS for web display)
+        target_fps = 30
         frame_interval = 1.0 / target_fps
-        print(f"[Kafka Consumer {camera.upper()}] Starting to consume messages at {target_fps} FPS...")
         
-        # Improved timeout handling
-        consecutive_timeouts = 0
-        max_consecutive_timeouts = 100  # Reduced from 10000
+        frame_count = 0
+        last_process_time = time.time()
         
-        while consecutive_timeouts < max_consecutive_timeouts:
-            try:
-                # Check if session is still active first
-                if session_id not in active_sessions:
-                    print(f"[Kafka Consumer {camera.upper()}] Session {session_id} no longer active, stopping consumer")
-                    break
-                
-                # Get message with better timeout handling
-                message_batch = consumer.poll(timeout_ms=2000)  # Increased timeout
-                
-                if not message_batch:
-                    consecutive_timeouts += 1
-                    if consecutive_timeouts % 10 == 0:  # Log every 10 timeouts
-                        print(f"[Kafka Consumer {camera.upper()}] No messages received (timeout {consecutive_timeouts}/{max_consecutive_timeouts})")
-                    time.sleep(0.1)  # Slightly longer sleep
-                    continue
-                
-                # Reset timeout counter on successful message
-                consecutive_timeouts = 0
-                
-                # Process messages with frame rate control
-                for topic_partition, messages in message_batch.items():
-                    for message in messages:
-                        # Frame rate control
-                        current_time = time.time()
-                        if current_time - last_frame_time < frame_interval:
-                            continue  # Skip this frame to maintain target FPS
-                        
-                        last_frame_time = current_time
-                        
-                        try:
-                            # Decode the frame
-                            frame_data = message.value
-                            
-                            # Only log every 100th frame to reduce console spam
-                            if frame_counter % 100 == 0:
-                                print(f"[Kafka Consumer {camera.upper()}] Processing frame {frame_counter}, data size: {len(frame_data)} bytes")
-                            
-                            # Decode image from bytes
-                            frame_buffer = np.frombuffer(frame_data, dtype=np.uint8)
-                            final_img = cv2.imdecode(frame_buffer, cv2.IMREAD_COLOR)
-                            
-                            if final_img is None:
-                                print(f"[Kafka Consumer {camera.upper()}] ERROR: Could not decode image, skipping...")
-                                continue
-
-                            # Encode frame to JPEG for web transmission
-                            _, buffer = cv2.imencode('.jpg', final_img, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                            frame_b64 = base64.b64encode(buffer).decode('utf-8')
-                            
-                            # Create the message dictionary
-                            websocket_message = {
-                                "type": "frame",
-                                "camera": camera,
-                                "data": frame_b64,
-                                "timestamp": datetime.now().isoformat(),
-                                "frame_count": frame_counter + 1
-                            }
-                            
-                            # Send to WebSocket via the main event loop
-                            websocket_queue.put((session_id, websocket_message))
-                            
-                            # Clean up memory immediately
-                            del frame_buffer, final_img, buffer, frame_b64
-                            frame_counter += 1
-                            
-                            # More frequent garbage collection
-                            if frame_counter % 50 == 0:
-                                import gc
-                                gc.collect()
-                                
-                        except Exception as e:
-                            print(f"[Kafka Consumer {camera.upper()}] Error processing message: {e}")
-                            continue
-                            
-            except Exception as e:
-                print(f"[Kafka Consumer {camera.upper()}] Error in consumer loop: {e}")
-                consecutive_timeouts += 1
-                time.sleep(1)  # Wait before retrying
+        while session_id in active_sessions:
+            current_time = time.time()
+            
+            # Frame rate control
+            if current_time - last_process_time < frame_interval:
+                time.sleep(0.01)  # Small sleep to prevent busy waiting
+                continue
+            
+            last_process_time = current_time
+            
+            # Read frames from both cameras (synchronized like run_reid)
+            ret1, frame1 = cap1.read()
+            ret2, frame2 = cap2.read()
+            
+            if not ret1 and not ret2:
+                print(f"[Direct Processing] End of videos reached")
+                break
+            
+            # Process frame1 (cam1) if available
+            if ret1 and frame1 is not None:
+                try:
+                    # Process frame with the same pipeline as run_reid
+                    result1 = pipeline.process(frame1, 'cam1')
                     
-        print(f"[Kafka Consumer {camera.upper()}] Consumer loop ended")
-                
+                    if result1 is not None:
+                        # Encode processed frame for WebSocket transmission
+                        _, buffer = cv2.imencode('.jpg', result1, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                        frame_b64 = base64.b64encode(buffer).decode('utf-8')
+                        
+                        # Send to WebSocket
+                        websocket_message = {
+                            "type": "frame",
+                            "camera": "cam1",
+                            "data": frame_b64,
+                            "timestamp": datetime.now().isoformat(),
+                            "frame_count": frame_count + 1
+                        }
+                        
+                        websocket_queue.put((session_id, websocket_message))
+                        
+                        # Clean up
+                        del buffer, frame_b64, result1
+                    
+                    del frame1
+                    
+                except Exception as e:
+                    print(f"[Direct Processing] Error processing cam1 frame: {e}")
+            
+            # Process frame2 (cam2) if available
+            if ret2 and frame2 is not None:
+                try:
+                    # Process frame with thesame pipeline as run_reid
+                    result2 = pipeline.process(frame2, 'cam2')
+                    
+                    if result2 is not None:
+                        # Encode processed frame for WebSocket transmission
+                        _, buffer = cv2.imencode('.jpg', result2, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                        frame_b64 = base64.b64encode(buffer).decode('utf-8')
+                        
+                        # Send to WebSocket
+                        websocket_message = {
+                            "type": "frame",
+                            "camera": "cam2",
+                            "data": frame_b64,
+                            "timestamp": datetime.now().isoformat(),
+                            "frame_count": frame_count + 1
+                        }
+                        
+                        websocket_queue.put((session_id, websocket_message))
+                        
+                        # Clean up
+                        del buffer, frame_b64, result2
+                    
+                    del frame2
+                    
+                except Exception as e:
+                    print(f"[Direct Processing] Error processing cam2 frame: {e}")
+            
+            frame_count += 1
+            
+            # Garbage collection and progress logging (same as run_reid)
+            if frame_count % 100 == 0:
+                gc.collect()
+                if frame_count % 500 == 0:
+                    print(f"[Direct Processing] Processed {frame_count} frames")
+                    current_stats = classifier.get_statistics()
+                    print(f"[Direct Processing] Current database size: {current_stats['total']} embeddings")
+        
+        print(f"[Direct Processing] Processing completed for session {session_id}")
+        
     except Exception as e:
-        print(f"[Kafka Consumer {camera.upper()}] Error in consumer thread: {e}")
+        print(f"[Direct Processing] Error: {e}")
         import traceback
         traceback.print_exc()
     finally:
+        # Clean up resources
         try:
-            consumer.close()
-            print(f"[Kafka Consumer {camera.upper()}] Consumer closed for session {session_id}")
-        except:
-            pass
+            cap1.release()
+            cap2.release()
+            if 'pipeline' in locals():
+                pipeline.close()
+            print(f"[Direct Processing] Resources cleaned up for session {session_id}")
+        except Exception as e:
+            print(f"[Direct Processing] Error during cleanup: {e}")
 
 def matching_monitor_thread(session_id: str):
     """Thread function to monitor matching folder for new vehicle matches"""
@@ -399,56 +414,68 @@ async def get_latest_matches():
     matching_dir = BASE_DIR.parent / "matching"
     
     try:
-        image_files = []
+        matches = []
         
         # Debug log for troubleshooting
-        print(f"[Latest Matches] Looking for images in {matching_dir}")
+        # print(f"[Latest Matches] Looking for images in {matching_dir}")
         
-        # First, get all image files directly from the matching folder (flat structure)
-        flat_files = list(matching_dir.glob("*.jpg"))
-        image_files.extend(flat_files)
-        print(f"[Latest Matches] Found {len(flat_files)} flat files")
+        # Check for vehicle subdirectories in matching folder
+        vehicle_dirs = [d for d in matching_dir.iterdir() if d.is_dir()]
+        # print(f"[Latest Matches] Found {len(vehicle_dirs)} vehicle directories")
         
-        # Then, get all image files from subdirectories (legacy structure)
-        for subdir in matching_dir.iterdir():
-            if subdir.is_dir():
-                subdir_files = list(subdir.glob("*.jpg"))
-                print(f"[Latest Matches] Found {len(subdir_files)} files in subdirectory {subdir.name}")
-                image_files.extend(subdir_files)
-        
-        print(f"[Latest Matches] Total images found: {len(image_files)}")
-        
-        if not image_files:
-            # For testing: use some hardcoded test images if none are found
-            test_dir = matching_dir / "test1"
-            if test_dir.exists():
-                test_images = list(test_dir.glob("*.jpg"))
-                if test_images:
-                    print(f"[Latest Matches] Found {len(test_images)} test images in {test_dir}")
-                    image_files.extend(test_images)
-        
-        # Sort by modification time (newest first)
-        image_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
-        
-        matches = []
-        # Limit to the latest 20 matches
-        for img_path in image_files[:20]:
+        # Process each vehicle directory
+        for vehicle_dir in vehicle_dirs:
+            # Get all image files in this vehicle directory
+            vehicle_images = list(vehicle_dir.glob("*.jpg"))
+            # print(f"[Latest Matches] Found {len(vehicle_images)} images in {vehicle_dir.name}")
             
-            # Calculate the relative path from the matching directory
-            relative_path = img_path.relative_to(matching_dir)
-            
-            # Create camera tag based on filename or path
-            camera_tag = "cam1" if "cam1" in img_path.name.lower() else "cam2" if "cam2" in img_path.name.lower() else "cam1" if "test1" in str(img_path) else "cam2"
-            
-            matches.append({
-                "filename": f"{camera_tag}_{img_path.name}",  # Add camera prefix if not present
-                "path": f"/matching/{relative_path.as_posix()}",
-                "thumbnail_url": f"/matching_resized/{img_path.name}?width=90&height=120",
-                "small_thumbnail_url": f"/matching_resized/{img_path.name}?width=60&height=80",
-                "timestamp": datetime.fromtimestamp(img_path.stat().st_mtime).isoformat()
-            })
+            if len(vehicle_images) >= 2:  # Only include vehicles with matches from both cameras
+                # Sort images by camera (cam1 first, then cam2)
+                cam1_images = [img for img in vehicle_images if "cam1" in img.name.lower()]
+                cam2_images = [img for img in vehicle_images if "cam2" in img.name.lower()]
+                
+                # Create match entries for each camera pair
+                for cam1_img in cam1_images:
+                    for cam2_img in cam2_images:
+                        # Calculate relative paths from matching directory
+                        relative_path1 = cam1_img.relative_to(matching_dir)
+                        relative_path2 = cam2_img.relative_to(matching_dir)
+                        
+                        # Get the latest modification time from both images
+                        latest_time = max(cam1_img.stat().st_mtime, cam2_img.stat().st_mtime)
+                        
+                        # Create match entry with both camera images
+                        match_entry = {
+                            "vehicle_id": vehicle_dir.name,
+                            "cam1": {
+                                "filename": cam1_img.name,
+                                "track_id": cam1_img.stem.split('_')[-1][-1],  # Extract track ID from filename
+                                "path": f"/matching/{relative_path1.as_posix()}",
+                                "thumbnail_url": f"/matching_resized/{vehicle_dir.name}/{cam1_img.name}?width=90&height=120",
+                                "small_thumbnail_url": f"/matching_resized/{vehicle_dir.name}/{cam1_img.name}?width=60&height=80"
+                            },
+                            "cam2": {
+                                "filename": cam2_img.name,
+                                "track_id": cam2_img.stem.split('_')[-1][-1],  # Extract track ID from filename
+                                "path": f"/matching/{relative_path2.as_posix()}",
+                                "thumbnail_url": f"/matching_resized/{vehicle_dir.name}/{cam2_img.name}?width=90&height=120",
+                                "small_thumbnail_url": f"/matching_resized/{vehicle_dir.name}/{cam2_img.name}?width=60&height=80"
+                            },
+                            "timestamp": datetime.fromtimestamp(latest_time).isoformat(),
+                            "match_time": latest_time
+                        }
+                        
+                        matches.append(match_entry)
         
-        print(f"[Latest Matches] Returning {len(matches)} matches")
+        # Sort by timestamp (newest first) and limit to 20 most recent matches
+        matches.sort(key=lambda x: x["match_time"], reverse=True)
+        matches = matches[:20]
+        
+        # Remove the internal match_time field before returning
+        for match in matches:
+            del match["match_time"]
+        
+        # print(f"[Latest Matches] Returning {len(matches)} vehicle matches")
         return {"matches": matches}
         
     except Exception as e:
@@ -456,7 +483,6 @@ async def get_latest_matches():
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail="Could not retrieve latest matches.")
-
 
 @app.get("/", response_class=HTMLResponse)
 async def read_root():
@@ -470,14 +496,13 @@ async def start_session():
     """Start a new processing session"""
     session_id = str(uuid.uuid4())[:8]
     
-    # Create session data
+    # Create session data (updated for direct processing)
     session_data = {
         "id": session_id,
         "status": "initialized",
         "created_at": datetime.now().isoformat(),
         "cameras": {"cam1": None, "cam2": None},
-        "spark_thread": None,
-        "kafka_threads": {"cam1": None, "cam2": None},
+        "processing_thread": None,  # Replaces spark_thread and kafka_threads
         "matching_thread": None
     }
     
@@ -514,7 +539,7 @@ async def upload_video(session_id: str, camera: str, file: UploadFile = File(...
 
 @app.post("/start_processing/{session_id}")
 async def start_processing(session_id: str):
-    """Start processing the uploaded videos"""
+    """Start processing the uploaded videos using direct pipeline (like run_reid)"""
     if session_id not in active_sessions:
         raise HTTPException(status_code=404, detail="Session not found")
     
@@ -525,59 +550,12 @@ async def start_processing(session_id: str):
         raise HTTPException(status_code=400, detail="Both camera videos must be uploaded")
     
     try:
-        # Create Kafka topics first
-        print(f"[Processing] Creating Kafka topics for session {session_id}")
-        ensure_kafka_topic(session_id, bootstrap_servers='localhost:9092')
+        print(f"[Processing] Starting direct video processing for session {session_id}")
         
-        # Start Spark streaming, passing the absolute base directory
-        print(f"[Processing] Starting Spark streaming for session {session_id}")
-        # The base directory for spark is the root of the Vehicle-Re-ID project
-        spark_base_dir = BASE_DIR.parent 
-        spark_thread = start_spark(session_id, base_dir=spark_base_dir)
-        session_data["spark_thread"] = spark_thread
-        
-        # Wait for Spark to initialize
-        print(f"[Processing] Waiting for Spark to initialize...")
-        await asyncio.sleep(30)  # Increased to 30 seconds to ensure Spark is ready
-        
-        # Start video producers
-        print(f"[Processing] Starting video producers for session {session_id}")
-        
-        # Start cam1 producer with controlled frame rate
-        producer1 = VideoProducer(
-            video_path=session_data["cameras"]["cam1"],
-            topic_name=f"cam1_{session_id}",
-            bootstrap_servers="localhost:9092",
-            fps= None  # Set to 6 FPS for controlled streaming
-        )
-        
-        # Start cam2 producer with controlled frame rate
-        producer2 = VideoProducer(
-            video_path=session_data["cameras"]["cam2"],
-            topic_name=f"cam2_{session_id}",
-            bootstrap_servers="localhost:9092",
-            fps= None  # Set to 6 FPS for controlled streaming
-        )
-        
-        # Start producers in threads
-        producer1_thread = threading.Thread(target=producer1.start_streaming)
-        producer2_thread = threading.Thread(target=producer2.start_streaming)
-        
-        producer1_thread.start()
-        producer2_thread.start()
-        
-        # Start Kafka consumer threads for each camera
-        print(f"[Processing] Starting Kafka consumer threads for session {session_id}")
-        
-        # Consumer for cam1
-        kafka_thread_cam1 = threading.Thread(target=kafka_consumer_thread, args=(session_id, "cam1"))
-        kafka_thread_cam1.start()
-        session_data["kafka_threads"]["cam1"] = kafka_thread_cam1
-        
-        # Consumer for cam2
-        kafka_thread_cam2 = threading.Thread(target=kafka_consumer_thread, args=(session_id, "cam2"))
-        kafka_thread_cam2.start()
-        session_data["kafka_threads"]["cam2"] = kafka_thread_cam2
+        # Start direct video processing thread (replaces Spark+Kafka)
+        processing_thread = threading.Thread(target=direct_video_processing_thread, args=(session_id,))
+        processing_thread.start()
+        session_data["processing_thread"] = processing_thread
         
         # Start matching monitor thread
         matching_thread = threading.Thread(target=matching_monitor_thread, args=(session_id,))
@@ -588,10 +566,10 @@ async def start_processing(session_id: str):
         session_data["status"] = "processing"
         session_data["processing_start_time"] = datetime.now().isoformat()
         
-        print(f"[Processing] Started processing for session {session_id}")
+        print(f"[Processing] Started direct processing for session {session_id}")
         
         return {
-            "message": "Processing started", 
+            "message": "Processing started with direct pipeline", 
             "session_id": session_id,
             "start_time": session_data["processing_start_time"]
         }
@@ -626,21 +604,14 @@ async def get_session_status(session_id: str):
     
     session_data = active_sessions[session_id]
     
-    # Get additional status information
-    spark_thread_alive = False
-    kafka_threads_alive = {"cam1": False, "cam2": False}
+    # Get thread status
+    processing_thread_alive = False
     matching_thread_alive = False
     
-    if session_data["spark_thread"]:
-        spark_thread_alive = session_data["spark_thread"].is_alive()
+    if session_data.get("processing_thread"):
+        processing_thread_alive = session_data["processing_thread"].is_alive()
         
-    if session_data["kafka_threads"]["cam1"]:
-        kafka_threads_alive["cam1"] = session_data["kafka_threads"]["cam1"].is_alive()
-        
-    if session_data["kafka_threads"]["cam2"]:
-        kafka_threads_alive["cam2"] = session_data["kafka_threads"]["cam2"].is_alive()
-        
-    if session_data["matching_thread"]:
+    if session_data.get("matching_thread"):
         matching_thread_alive = session_data["matching_thread"].is_alive()
     
     return {
@@ -652,9 +623,7 @@ async def get_session_status(session_id: str):
             "cam2": session_data["cameras"]["cam2"] is not None
         },
         "threads": {
-            "spark_alive": spark_thread_alive,
-            "kafka_cam1_alive": kafka_threads_alive["cam1"],
-            "kafka_cam2_alive": kafka_threads_alive["cam2"],
+            "processing_alive": processing_thread_alive,
             "matching_alive": matching_thread_alive
         },
         "processing_info": {
@@ -717,7 +686,7 @@ async def debug_session(session_id: str):
         "session_id": session_id,
         "session_exists": session_id in active_sessions,
         "websocket_connected": session_id in manager.active_connections,
-        "kafka_topics": [],
+        "processing_mode": "direct_pipeline",
         "database_path": f"./chroma_vehicle_reid_streaming/{session_id}",
         "database_exists": False,
         "matching_files": 0
@@ -732,34 +701,11 @@ async def debug_session(session_id: str):
             "cam2": session_data["cameras"]["cam2"] is not None
         }
         debug_info["threads"] = {
-            "spark_thread": session_data["spark_thread"] is not None,
-            "kafka_thread_cam1": session_data["kafka_threads"]["cam1"] is not None,
-            "kafka_thread_cam2": session_data["kafka_threads"]["cam2"] is not None,
-            "matching_thread": session_data["matching_thread"] is not None
+            "processing_thread": session_data["processing_thread"] is not None,
+            "processing_thread_alive": session_data["processing_thread"].is_alive() if session_data["processing_thread"] else False,
+            "matching_thread": session_data["matching_thread"] is not None,
+            "matching_thread_alive": session_data["matching_thread"].is_alive() if session_data["matching_thread"] else False
         }
-    
-    # Check Kafka topics
-    try:
-        from kafka.admin import KafkaAdminClient
-        admin_client = KafkaAdminClient(bootstrap_servers=['localhost:9092'])
-        all_topics = admin_client.list_topics()
-        
-        expected_topics = [
-            f'cam1_{session_id}',
-            f'cam2_{session_id}',
-            f'cam1_processed_{session_id}',
-            f'cam2_processed_{session_id}'
-        ]
-        
-        for topic in expected_topics:
-            debug_info["kafka_topics"].append({
-                "topic": topic,
-                "exists": topic in all_topics
-            })
-        
-        admin_client.close()
-    except Exception as e:
-        debug_info["kafka_error"] = str(e)
     
     # Check database
     import os
@@ -862,45 +808,33 @@ async def test_frame(session_id: str, camera: str = "cam1"):
         
     except Exception as e:
         return {"error": f"Failed to send test frame: {str(e)}"}
-@app.get("/matching_resized/{filename}")
-async def get_resized_matching_image(filename: str, width: int = 90, height: int = 120):
-    """Serve a resized version of a matching image"""
+@app.get("/matching_resized/{vehicle_id}/{filename}")
+async def get_resized_matching_image(vehicle_id: str, filename: str, width: int = 90, height: int = 120):
+    """Serve a resized version of a matching image from a specific vehicle directory"""
     try:
         matching_dir = BASE_DIR.parent / "matching"
         
-        # Clean filename by removing any camera prefix (cam1_, cam2_)
-        clean_filename = filename
-        if clean_filename.startswith(("cam1_", "cam2_")):
-            clean_filename = clean_filename[5:]  # Remove the prefix
+        print(f"[Resize] Looking for image: {filename} in vehicle directory: {vehicle_id}")
         
-        print(f"[Resize] Looking for image: {clean_filename}, original request: {filename}")
+        # Construct the full path to the image
+        vehicle_dir = matching_dir / vehicle_id
+        image_path = vehicle_dir / filename
         
-        # Try to find the file in the matching directory or subdirectories
-        image_path = None
+        # Check if the vehicle directory exists
+        if not vehicle_dir.exists():
+            print(f"[Resize] Vehicle directory not found: {vehicle_dir}")
+            raise HTTPException(status_code=404, detail=f"Vehicle directory '{vehicle_id}' not found")
         
-        # First check if it's a flat file
-        flat_file = matching_dir / clean_filename
-        if flat_file.exists():
-            image_path = flat_file
-            print(f"[Resize] Found image as flat file: {flat_file}")
-        else:
-            # Check subdirectories
-            for subdir in matching_dir.iterdir():
-                if subdir.is_dir():
-                    subdir_file = subdir / clean_filename
-                    if subdir_file.exists():
-                        image_path = subdir_file
-                        print(f"[Resize] Found image in subdirectory: {subdir_file}")
-                        break
+        # Check if the image file exists
+        if not image_path.exists():
+            print(f"[Resize] Image file not found: {image_path}")
+            raise HTTPException(status_code=404, detail=f"Image '{filename}' not found in vehicle '{vehicle_id}'")
         
-        if not image_path:
-            print(f"[Resize] Image not found: {clean_filename}")
-            raise HTTPException(status_code=404, detail="Image not found")
+        print(f"[Resize] Found image: {image_path}")
         
         # Read and resize the image
         import cv2
         import numpy as np
-        from io import BytesIO
         
         # Read the original image
         original_img = cv2.imread(str(image_path))
@@ -949,40 +883,87 @@ async def get_resized_matching_image(filename: str, width: int = 90, height: int
             headers={"Cache-Control": "public, max-age=3600"}  # Cache for 1 hour
         )
         
+    except HTTPException:
+        # Re-raise HTTP exceptions as they are
+        raise
     except Exception as e:
-        print(f"Error serving resized image {filename}: {e}")
+        print(f"Error serving resized image {vehicle_id}/{filename}: {e}")
         raise HTTPException(status_code=500, detail="Could not process image")
 
-
-@app.get("/test_resize")
-async def test_resize():
-    """Test endpoint to verify image resizing works"""
+# Fallback endpoint for backward compatibility (old URL structure)
+@app.get("/matching_resized/{filename}")
+async def get_resized_matching_image_fallback(filename: str, width: int = 90, height: int = 120):
+    """Fallback endpoint for backward compatibility - searches all vehicle directories"""
     try:
         matching_dir = BASE_DIR.parent / "matching"
         
-        # Get the first available image
-        test_image = None
-        for img_path in matching_dir.glob("*.jpg"):
-            test_image = img_path
-            break
+        # Clean filename by removing any camera prefix (cam1_, cam2_)
+        clean_filename = filename
+        if clean_filename.startswith(("cam1_", "cam2_")):
+            clean_filename = clean_filename[5:]  # Remove the prefix
         
-        if not test_image:
-            # Check subdirectories
-            for subdir in matching_dir.iterdir():
-                if subdir.is_dir():
-                    for img_path in subdir.glob("*.jpg"):
-                        test_image = img_path
-                        break
-                if test_image:
+        print(f"[Resize Fallback] Looking for image: {clean_filename}, original request: {filename}")
+        
+        # Try to find the file in any vehicle subdirectory
+        image_path = None
+        vehicle_id = None
+        
+        # Search through all vehicle directories
+        for subdir in matching_dir.iterdir():
+            if subdir.is_dir():
+                subdir_file = subdir / clean_filename
+                if subdir_file.exists():
+                    image_path = subdir_file
+                    vehicle_id = subdir.name
+                    print(f"[Resize Fallback] Found image in vehicle directory: {subdir_file}")
                     break
         
+        if not image_path:
+            print(f"[Resize Fallback] Image not found: {clean_filename}")
+            raise HTTPException(status_code=404, detail="Image not found")
+        
+        # Redirect to the new endpoint structure
+        return await get_resized_matching_image(vehicle_id, clean_filename, width, height)
+        
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        print(f"Error in fallback resize endpoint for {filename}: {e}")
+        raise HTTPException(status_code=500, detail="Could not process image")
+
+@app.get("/test_resize")
+async def test_resize():
+    """Test endpoint to verify image resizing works with new folder structure"""
+    try:
+        matching_dir = BASE_DIR.parent / "matching"
+        
+        # Get the first available image from any vehicle directory
+        test_image = None
+        vehicle_id = None
+        
+        # Search through vehicle directories
+        for subdir in matching_dir.iterdir():
+            if subdir.is_dir():
+                for img_path in subdir.glob("*.jpg"):
+                    test_image = img_path
+                    vehicle_id = subdir.name
+                    break
+            if test_image:
+                break
+        
         if test_image:
+            # Calculate relative path from matching directory
+            relative_path = test_image.relative_to(matching_dir)
+            
             return {
                 "success": True,
+                "vehicle_id": vehicle_id,
                 "test_image": test_image.name,
-                "original_url": f"/matching/{test_image.relative_to(matching_dir).as_posix()}",
-                "thumbnail_url": f"/matching_resized/{test_image.name}?width=300&height=200",
-                "small_thumbnail_url": f"/matching_resized/{test_image.name}?width=150&height=100"
+                "original_url": f"/matching/{relative_path.as_posix()}",
+                "thumbnail_url": f"/matching_resized/{vehicle_id}/{test_image.name}?width=300&height=200",
+                "small_thumbnail_url": f"/matching_resized/{vehicle_id}/{test_image.name}?width=150&height=100",
+                "fallback_url": f"/matching_resized/{test_image.name}?width=300&height=200"
             }
         else:
             return {"success": False, "message": "No test images found"}
@@ -990,6 +971,101 @@ async def test_resize():
     except Exception as e:
         return {"error": f"Test failed: {str(e)}"}
 
+@app.get("/test_latest_matches")
+async def test_latest_matches():
+    """Test endpoint to verify latest matches works with new folder structure"""
+    try:
+        # Call the actual latest_matches endpoint
+        result = await get_latest_matches()
+        
+        return {
+            "success": True,
+            "matches_found": len(result.get("matches", [])),
+            "sample_match": result.get("matches", [])[0] if result.get("matches") else None,
+            "structure": "vehicle_id -> cam1/cam2 images"
+        }
+        
+    except Exception as e:
+        return {"error": f"Test failed: {str(e)}"}
+
+@app.get("/inspect_matching_structure")
+async def inspect_matching_structure():
+    """Inspect the current matching folder structure for debugging"""
+    try:
+        matching_dir = BASE_DIR.parent / "matching"
+        
+        if not matching_dir.exists():
+            return {"error": "Matching directory does not exist"}
+        
+        structure = {
+            "matching_dir": str(matching_dir),
+            "exists": True,
+            "vehicle_directories": {}
+        }
+        
+        # List all subdirectories (vehicle IDs)
+        for subdir in matching_dir.iterdir():
+            if subdir.is_dir():
+                vehicle_images = []
+                for img_file in subdir.glob("*.jpg"):
+                    vehicle_images.append({
+                        "filename": img_file.name,
+                        "camera": "cam1" if "cam1" in img_file.name.lower() else "cam2" if "cam2" in img_file.name.lower() else "unknown",
+                        "size": img_file.stat().st_size,
+                        "modified": datetime.fromtimestamp(img_file.stat().st_mtime).isoformat()
+                    })
+                
+                structure["vehicle_directories"][subdir.name] = {
+                    "path": str(subdir),
+                    "image_count": len(vehicle_images),
+                    "images": vehicle_images
+                }
+        
+        structure["total_vehicles"] = len(structure["vehicle_directories"])
+        structure["total_images"] = sum(len(v["images"]) for v in structure["vehicle_directories"].values())
+        
+        return structure
+        
+    except Exception as e:
+        return {"error": f"Failed to inspect structure: {str(e)}"}
+    
+@app.post("/test_direct_processing")
+async def test_direct_processing():
+    """Test endpoint to verify direct processing pipeline components"""
+    try:
+        # Test pipeline component imports
+        from realtime_reid.vehicle_detector import VehicleDetector
+        from realtime_reid.feature_extraction import VehicleDescriptor
+        from realtime_reid.classifier_chromadb import ChromaDBVehicleReID
+        from realtime_reid.pipeline import Pipeline
+        
+        test_results = {
+            "imports_successful": True,
+            "components_available": {
+                "VehicleDetector": True,
+                "VehicleDescriptor": True,
+                "ChromaDBVehicleReID": True,
+                "Pipeline": True
+            },
+            "model_files_check": {
+                "vehicle_detector": os.path.exists("best_20.pt") or os.path.exists(str(BASE_DIR.parent / "best_20.pt")),
+                "feature_extractor": os.path.exists("best_osnet_model.pth") or os.path.exists(str(BASE_DIR.parent / "best_osnet_model.pth"))
+            },
+            "processing_mode": "direct_pipeline",
+            "message": "Direct processing pipeline is ready"
+        }
+        
+        return test_results
+        
+    except Exception as e:
+        return {
+            "imports_successful": False,
+            "error": str(e),
+            "message": "Direct processing pipeline test failed"
+        }
+    
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="localhost", port=8000)
+
+
