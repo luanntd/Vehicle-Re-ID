@@ -5,17 +5,6 @@ from torch.utils.data import Dataset
 class VehicleReIDDataset(Dataset):
     """
     Dataset class for Vehicle Re-ID training
-    
-    Expected data format:
-    dataset/
-    ├── images/
-    │   ├── car_0001_cam1.jpg  # Format: vehicleType_vehicleID_cameraID.jpg
-    │   ├── car_0001_cam2.jpg
-    │   ├── car_0002_cam1.jpg
-    │   └── ...
-    ├── train.txt              # List of training image names
-    ├── test.txt               # List of test image names
-    └── query.txt              # List of query image names
     """
     
     def __init__(self, data_dir, split='train', transform=None):
