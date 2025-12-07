@@ -18,6 +18,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def train(
     data_dir,
+    image_dir,
     model_type='osnet',
     num_epochs=120,
     batch_size=32,
@@ -52,8 +53,8 @@ def train(
     ])
     
     # Create datasets and dataloaders
-    train_dataset = VehicleReIDDataset(data_dir, split='train', transform=train_transform)
-    val_dataset = VehicleReIDDataset(data_dir, split='val', transform=val_transform)
+    train_dataset = VehicleReIDDataset(data_dir, image_dir, split='train', transform=train_transform)
+    val_dataset = VehicleReIDDataset(data_dir, image_dir, split='val', transform=val_transform)
     
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, 
                              num_workers=4, pin_memory=True)
@@ -242,10 +243,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Train Vehicle Re-ID Model')
     parser.add_argument('--data_dir', type=str, default='data',
                        help='Path to dataset directory')
+    parser.add_argument('--image_dir', type=str, default='data/images',
+                       help='Path to image directory')
     parser.add_argument('--model_type', type=str, default='osnet',
                        choices=['osnet', 'resnet_ibn', 'efficientnet'],
                        help='Type of model to train')
-    parser.add_argument('--epochs', type=int, default=20,
+    parser.add_argument('--epochs', type=int, default=50,
                        help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=32,
                        help='Training batch size')
@@ -260,6 +263,7 @@ if __name__ == "__main__":
     # Train model
     train(
         data_dir=args.data_dir,
+        image_dir=args.image_dir,
         model_type=args.model_type,
         num_epochs=args.epochs,
         batch_size=args.batch_size,

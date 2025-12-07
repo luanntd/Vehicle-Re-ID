@@ -7,9 +7,9 @@ class VehicleReIDDataset(Dataset):
     Dataset class for Vehicle Re-ID training
     """
     
-    def __init__(self, data_dir, split='train', transform=None):
+    def __init__(self, data_dir, image_dir, split='train', transform=None):
         self.data_dir = Path(data_dir)
-        self.image_dir = self.data_dir / 'images'
+        self.image_dir = Path(image_dir)
         self.split = split
         self.transform = transform
         
