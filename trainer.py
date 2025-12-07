@@ -117,7 +117,8 @@ def train(
         running_triplet_loss = 0.0
         running_center_loss = 0.0
         
-        pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs} [Train]')
+        current_lr = scheduler.get_last_lr()[0]
+        pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs} [Train | LR={current_lr:.6f}]')
         for batch in pbar:
             images = batch['image'].to(device)
             labels = batch['label'].to(device)
@@ -177,7 +178,7 @@ def train(
                 test_mAP = evaluate(model, test_loader, model_type)
                 test_history.append((epoch + 1, test_mAP))
 
-            print(f'Epoch {epoch+1}: Train Loss = {avg_loss:.4f}, Val mAP = {val_mAP:.4f}')
+            print(f'Epoch {epoch+1}: Train Loss = {avg_loss:.4f}, Val mAP = {val_mAP:.4f}, LR = {current_lr:.6f}')
             if test_mAP is not None:
                 print(f'               Test mAP = {test_mAP:.4f}')
             
@@ -299,6 +300,10 @@ if __name__ == "__main__":
                        help='Training batch size')
     parser.add_argument('--lr', type=float, default=0.0003,
                        help='Learning rate')
+    parser.add_argument('--lr_step_size', type=int, default=40,
+                       help='StepLR step size (epochs)')
+    parser.add_argument('--lr_gamma', type=float, default=0.1,
+                       help='StepLR decay factor')
     parser.add_argument('--save_dir', type=str, default='checkpoints',
                        help='Directory to save models')
     parser.add_argument('--eval_interval', type=int, default=5,
@@ -315,6 +320,8 @@ if __name__ == "__main__":
         num_epochs=args.epochs,
         batch_size=args.batch_size,
         learning_rate=args.lr,
+        step_size=args.lr_step_size,
+        gamma=args.lr_gamma,
         save_dir=args.save_dir,
         test_image_dir=args.test_image_dir,
         eval_interval=args.eval_interval
