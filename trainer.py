@@ -16,6 +16,8 @@ from modules.feature_extraction import OSNet, ResNetIBN, create_vehicle_descript
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+import random
+
 def train(
     data_dir,
     image_dir,
@@ -29,10 +31,15 @@ def train(
     margin=0.3,
     save_dir='checkpoints',
     test_image_dir=None,
-    eval_interval=1
+    eval_interval=1,
+    seed=123
     ):
     # Create save directory
     os.makedirs(save_dir, exist_ok=True)
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed) 
     
     # Define transforms
     train_transform = transforms.Compose([
@@ -308,6 +315,8 @@ if __name__ == "__main__":
                        help='Directory to save models')
     parser.add_argument('--eval_interval', type=int, default=5,
                        help='How often (in epochs) to run eval on val/test sets')
+    parser.add_argument('--seed', type=int, default=123,
+                       help='Random seed for reproducibility')
     
     args = parser.parse_args()
     
@@ -324,5 +333,6 @@ if __name__ == "__main__":
         gamma=args.lr_gamma,
         save_dir=args.save_dir,
         test_image_dir=args.test_image_dir,
-        eval_interval=args.eval_interval
+        eval_interval=args.eval_interval,
+        seed=args.seed
     )
