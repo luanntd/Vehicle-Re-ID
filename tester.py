@@ -100,7 +100,6 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description='Test Vehicle Re-ID Model on images_test')
     parser.add_argument('--data_dir', type=str, default='data', help='Path to dataset root (should contain images_test)')
-    parser.add_argument('--image_dir', type=str, default='data/images_test', help='Path to image directory')
     parser.add_argument('--model_type', type=str, default='osnet', choices=['osnet', 'resnet_ibn', 'efficientnet'], help='Model type')
     parser.add_argument('--model_path', type=str, default='checkpoints/best_osnet_model.pth', help='Path to trained model checkpoint')
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size for testing')
@@ -117,7 +116,7 @@ def main():
     ])
 
     # Prepare test data from images_test directory
-    images_test_dir = args.image_dir
+    images_test_dir = os.path.join(args.data_dir, 'images_test')
     if not os.path.exists(images_test_dir):
         print(f"Error: {images_test_dir} does not exist!")
         return
@@ -136,7 +135,7 @@ def main():
             f.write(f"{img}\n")
 
     # Dataset and loader
-    dataset = VehicleReIDDataset(args.data_dir, args.image_dir, split='test', transform=val_transform)
+    dataset = VehicleReIDDataset(args.data_dir, split='test', transform=val_transform)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
     
     print(f"Dataset loaded: {len(dataset)} samples, {dataset.num_classes} unique vehicles")

@@ -3,367 +3,473 @@ import numpy as np
 import cv2
 import findspark
 import shutil
+import json
+import base64
+import torch
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import udf
 from pyspark.sql.types import BinaryType
+from pyspark.sql.streaming import StreamingQueryListener
 from pathlib import Path
 import time
+import os
 import traceback
 import gc
-from modules.pipeline import Pipeline
+from modules import color
+from kafka import KafkaProducer
+from modules.pipeline import Pipeline_spark
 from modules.vehicle_detection import VehicleDetector
 from modules.feature_extraction import VehicleDescriptor
-from modules.reid_chromadb import ChromaDBVehicleReID
+from modules.reid_chromadb import ChromaDBVehicleReID_spark
 
 # Configure Python's garbage collector for better memory management
 gc.set_threshold(100, 5, 5)
 
-# Global pipeline instance with thread safety
-_shared_pipeline = None
-_current_session_id = None
-_pipeline_lock = threading.Lock()
+_model_state_bc = None
+_shared_model = None
+_kafka_producer = None
+_processed_cross_camera = set()
+_producer_lock = threading.Lock()
 
-def get_or_create_shared_pipeline(session_id=None, base_dir=None):
-    """Get or create the shared pipeline instance with ChromaDB backend."""
-    global _shared_pipeline, _current_session_id, _pipeline_lock
-    
-    if base_dir is None:
-        base_dir = Path(__file__).resolve().parents[2]
-    else:
-        base_dir = Path(base_dir)
 
-    with _pipeline_lock:
-        if _shared_pipeline is None or _current_session_id != session_id:
-            print(f"[Pipeline] Creating pipeline for session {session_id}")
-            _current_session_id = session_id
-            
-            # Clean up old pipeline if exists
-            if _shared_pipeline is not None:
-                try:
-                    if hasattr(_shared_pipeline, 'classifier') and hasattr(_shared_pipeline.classifier, 'close'):
-                        _shared_pipeline.classifier.close()
-                    _shared_pipeline = None
-                    gc.collect()
-                except Exception as e:
-                    print(f"[Pipeline] Warning: Error during cleanup: {e}")
-            
-            try:
-                # Model paths
-                detector_path = base_dir / 'best_20.pt'
-                descriptor_path = base_dir / 'best_osnet_model.pth'
-                db_path = base_dir / f"chroma_vehicle_reid_streaming/{session_id}" if session_id else base_dir / "chroma_vehicle_reid_streaming"
+def _parse_capture_ts_ms_from_key(key_value):
+    if key_value is None:
+        return None
+    try:
+        key_str = key_value
+        if isinstance(key_value, (bytes, bytearray, memoryview)):
+            key_str = bytes(key_value).decode("utf-8", errors="ignore")
+        else:
+            key_str = str(key_value)
+        ts_part = key_str.split(":", 1)[0].strip()
+        if not ts_part:
+            return None
+        return int(ts_part)
+    except Exception:
+        return None
 
-                # Create components
-                detector = VehicleDetector(model_path=str(detector_path))
-                descriptor = VehicleDescriptor(model_type='osnet', model_path=str(descriptor_path))
-                classifier = ChromaDBVehicleReID(
-                    db_path=str(db_path),
-                    collection_name=f"vehicle_embeddings_streaming{f'_{session_id}' if session_id else ''}"
-                )
-                
-                # Create pipeline
-                _shared_pipeline = Pipeline(detector=detector, descriptor=descriptor, classifier=classifier)
-                print("[Pipeline] Created successfully")
-                
-                # Show database statistics
-                stats = classifier.get_statistics()
-                print(f"[Pipeline] Database: {stats['total']} embeddings, Max IDs: {stats['max_ids']}")
-                
-                gc.collect()
-                
-            except Exception as e:
-                print(f"[Pipeline] ERROR creating pipeline: {e}")
-                traceback.print_exc()
-                _shared_pipeline = None
-                raise
-                
-    return _shared_pipeline
 
-def start_spark(session_id=None, base_dir=None):
-    """Start Spark Streaming with ChromaDB vehicle re-identification."""
-    
-    # Spark/Kafka configuration
-    SCALA_VERSION = '2.13'
-    SPARK_VERSION = '4.0.0'
-    KAFKA_VERSION = '3.5.0'
-    
-    print(f"Starting Spark Streaming for session: {session_id or 'default'}")
-    
-    packages = [
-        f'org.apache.spark:spark-sql-kafka-0-10_{SCALA_VERSION}:{SPARK_VERSION}',
-        f'org.apache.kafka:kafka-clients:{KAFKA_VERSION}'
-    ]
+def get_or_create_kafka_producer():
+    global _kafka_producer
+    with _producer_lock:
+        if _kafka_producer is None:
+            _kafka_producer = KafkaProducer(
+                bootstrap_servers="localhost:9092",
+                linger_ms=5,
+                max_in_flight_requests_per_connection=1,
+            )
+            print("[KafkaProducer] Created shared producer")
+    return _kafka_producer
 
-    findspark.init()
-    
-    def spark_streaming_thread():
-        print("[SPARK] Starting streaming thread")
-        
+
+def close_kafka_producer():
+    global _kafka_producer
+    with _producer_lock:
+        if _kafka_producer is None:
+            return
         try:
-            # Create Spark session
-            spark = SparkSession.builder \
-                .master('local[4]') \
-                .appName(f"vehicle-reid-{session_id}" if session_id else "vehicle-reid") \
-                .config("spark.jars.packages", ",".join(packages)) \
-                .config("spark.sql.adaptive.enabled", "false") \
-                .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer") \
-                .config("spark.python.worker.memory", "1g") \
-                .config("spark.driver.memory", "2g") \
-                .config("spark.executor.memory", "2g") \
-                .config("spark.python.worker.reuse", "true") \
-                .getOrCreate()
-            
-            print("[SPARK] Session created successfully")
-            
-            # Test pipeline creation
+            _kafka_producer.flush()
+        except Exception as flush_error:
+            print(f"[KafkaProducer] Flush warning: {flush_error}")
+        finally:
             try:
-                test_pipeline = get_or_create_shared_pipeline(session_id, base_dir)
-                print("[SPARK] Pipeline test successful")
-            except Exception as e:
-                print(f"[SPARK] Pipeline creation failed: {e}")
-                raise
-            
-            # Define Kafka parameters with better settings
-            kafka_params = {
-                "kafka.bootstrap.servers": "localhost:9092",
-                "subscribe": f"cam1_{session_id},cam2_{session_id}" if session_id else "cam1,cam2",
-                "maxOffsetsPerTrigger": "10",  # Reduced batch size to prevent memory spikes
-                "fetchOffset.numRetries": "5",  # Increased retries for better reliability
-                "kafka.consumer.fetch.max.bytes": "52428800",  # 50MB max fetch size
-                "kafka.fetch.message.max.bytes": "52428800",   # 50MB max message size
-                "fetchOffset.retryIntervalMs": "1000",
-                "kafka.session.timeout.ms": "30000",
-                "kafka.request.timeout.ms": "40000",
-                "kafka.max.poll.interval.ms": "300000"
+                _kafka_producer.close()
+                print("[KafkaProducer] Closed shared producer")
+            except Exception as close_error:
+                print(f"[KafkaProducer] Close warning: {close_error}")
+            _kafka_producer = None
+
+
+def get_shared_model(model_state_bc):
+    global _shared_model
+    try:   
+        state = model_state_bc.value
+        if state is None:
+            raise ValueError("Model state is not available in broadcast variable")
+        if _shared_model is None:
+            detector = VehicleDetector(model_path=state["detector_path"])
+            descriptor = VehicleDescriptor(model_type='osnet', model_path=state["descriptor_path"])
+            _shared_model = Pipeline_spark(detector=detector, descriptor=descriptor)
+            print("[Pipeline] Created successfully")
+        else:
+            print("[Pipeline] Reusing existing instance")
+    except Exception as e:
+        print(f"[Pipeline] ERROR creating pipeline: {e}")
+        traceback.print_exc()
+        gc.collect()
+        _shared_model = None
+        raise e
+    return _shared_model
+
+def _resolve_camera_from_topic(topic_value) -> str:
+    if topic_value is None:
+        return "unknown"
+    if isinstance(topic_value, (bytes, bytearray, memoryview)):
+        topic_str = bytes(topic_value).decode("utf-8", errors="ignore")
+    else:
+        topic_str = str(topic_value)
+    topic_root = topic_str.split("_")[0].strip()
+    return topic_root if topic_root else "unknown"
+
+
+def _serialize_payloads(payloads) -> str:
+    records = []
+    for payload in payloads:
+        try:
+            record = {
+                "camera_id": payload.camera_id,
+                "track_id": payload.track_id,
+                "vehicle_type": payload.vehicle_type,
+                "confidence": payload.confidence,
+                "timestamp": payload.timestamp,
+                "bbox": payload.bbox,
+                "image": base64.b64encode(payload.thumbnail).decode("utf-8") if payload.thumbnail else None,
+                "feature": payload.feature.tolist() if hasattr(payload.feature, "tolist") else list(payload.feature),
+                "thumbnail": base64.b64encode(payload.thumbnail).decode("utf-8") if payload.thumbnail else None,
             }
-            
-            print(f"[SPARK] Kafka parameters: {kafka_params}")
-            
-            # Create streaming DataFrame with Kafka source
-            print(f"[SPARK] Creating streaming DataFrame...")
-            df = spark.readStream \
-                .format("kafka") \
-                .options(**kafka_params) \
-                .option("startingOffsets", "latest") \
-                .load()
-            
-            print(f"[SPARK] Streaming DataFrame created")
-            
-            df = df.withColumn("value", df["value"].cast(BinaryType()))
-            
-            # UDF for processing frames with ChromaDB-backed pipeline
-            def create_process_frame_udf(session_id, base_dir_str):
-                frame_counter = 0
-                last_gc_time = time.time()
-                
-                @udf(BinaryType())
-                def process_frame_with_chromadb(value, topic):
-                    """Process individual frames using ChromaDB-backed vehicle ReID pipeline."""
-                    nonlocal frame_counter, last_gc_time
-                    frame_counter += 1
-                    current_time = time.time()
-                    
-                    try:    
-                        # Create pipeline instance inside UDF
-                        pipeline = get_or_create_shared_pipeline(session_id, base_dir_str)
-                        
-                        # Decode bytes to OpenCV frame
-                        frame_buffer = np.frombuffer(value, dtype=np.uint8)
-                        frame = cv2.imdecode(frame_buffer, cv2.IMREAD_COLOR)
-                        
-                        if frame is None:
-                            print(f"[UDF-ChromaDB] ERROR: Could not decode frame from {topic}")
-                            return value
-                        
-                        # Log progress occasionally
-                        if frame_counter % 100 == 0:
-                            print(f"[UDF-ChromaDB] Processed {frame_counter} frames from {topic}")
-                        
-                        # Extract camera ID from topic
-                        camera_id = 'cam1' if 'cam1' in topic else 'cam2'
-                        
-                        # Process frame through pipeline
-                        result = pipeline.process(frame, camera_id=camera_id)
-                        
-                        # Periodic garbage collection
-                        if current_time - last_gc_time > 60:  # Every minute
-                            import gc
-                            gc.collect()
-                            last_gc_time = current_time
-                        
-                        return value
-                        
-                    except Exception as e:
-                        print(f"[UDF-ChromaDB] ERROR processing frame: {e}")
-                        return value
-                        
-                return process_frame_with_chromadb
-            
-            # Create the UDF with session_id
-            print(f"[SPARK] Creating UDF...")
-            process_frame_udf = create_process_frame_udf(session_id, str(base_dir) if base_dir else None)
-            
-            # Process frames using UDF with ChromaDB-backed pipeline
-            print(f"[SPARK] Creating processed DataFrame...")
-            processed_df = df \
-                .selectExpr("CAST(key AS STRING) as key",
-                           "CAST(topic as STRING) as topic",
-                           "value") \
-                .withColumn("value", process_frame_udf("value", "topic"))
+            records.append(record)
+        except Exception as serialization_error:
+            print(f"[UDF] Payload serialization error: {serialization_error}")
+    return json.dumps(records)
 
-            # Define a base for checkpoint locations, using the base_dir if available
-            checkpoint_base = Path(base_dir) / "tmp" if base_dir else Path("tmp")
-            checkpoint_base.mkdir(exist_ok=True)
-            
-            # Clean up old checkpoint directories
-            checkpoint_dirs = [
-                checkpoint_base / f"cam1_processed_chromadb_{session_id}" if session_id else checkpoint_base / "cam1_processed_chromadb",
-                checkpoint_base / f"cam2_processed_chromadb_{session_id}" if session_id else checkpoint_base / "cam2_processed_chromadb"
-            ]
-            
-            for checkpoint_dir in checkpoint_dirs:
-                if checkpoint_dir.exists():
-                    try:
-                        shutil.rmtree(checkpoint_dir)
-                        print(f"[SPARK-ChromaDB] Cleaned up old checkpoint directory: {checkpoint_dir}")
-                    except Exception as e:
-                        print(f"[SPARK-ChromaDB] Warning: Could not clean checkpoint dir {checkpoint_dir}: {e}")
 
-            write_params = [
-                {
-                    "kafka.bootstrap.servers": "localhost:9092",
-                    "topic": f"cam1_processed_{session_id}" if session_id else "cam1_processed",
-                    "checkpointLocation": str(checkpoint_dirs[0]),
-                },
-                {
-                    "kafka.bootstrap.servers": "localhost:9092", 
-                    "topic": f"cam2_processed_{session_id}" if session_id else "cam2_processed",
-                    "checkpointLocation": str(checkpoint_dirs[1]),
-                }
-            ]
-            
-            # Write processed frames back to Kafka with better trigger settings
-            print(f"[SPARK] Starting streaming queries...")
-            query_topic1 = processed_df \
-                .filter(f"topic = 'cam1_{session_id}'" if session_id else "topic = 'cam1'") \
-                .select("key", "value") \
-                .writeStream \
-                .format("kafka") \
-                .options(**write_params[0]) \
-                .option("truncate", "false") \
-                .option("failOnDataLoss", "false") \
-                .outputMode("append") \
-                .trigger(processingTime="3 seconds") \
-                .start()
-
-            query_topic2 = processed_df \
-                .filter(f"topic = 'cam2_{session_id}'" if session_id else "topic = 'cam2'") \
-                .select("key", "value") \
-                .writeStream \
-                .format("kafka") \
-                .options(**write_params[1]) \
-                .option("truncate", "false") \
-                .option("failOnDataLoss", "false") \
-                .outputMode("append") \
-                .trigger(processingTime="3 seconds") \
-                .start()
-
-            try:
-                # Wait for both queries to process all data with a timeout mechanism
-                print("[SPARK-ChromaDB] Starting vehicle ReID streaming with ChromaDB backend...")
-                
-                # Log initial memory usage
-                print("[SPARK-ChromaDB] Initial processing started")
-                
-                # Keep track of last activity time and memory check time
-                last_active_time = time.time()
-                last_gc_time = time.time()
-                idle_timeout = 300  # 5 minutes idle timeout
-                gc_interval = 120  # Force GC every 2 minutes
-                
-                # Simplified monitoring loop
-                while True:
-                    time.sleep(10)  # Check every 10 seconds
-                    
-                    # Check if both queries are still active
-                    if not query_topic1.isActive and not query_topic2.isActive:
-                        print("[SPARK-ChromaDB] Both queries completed. Stopping.")
-                        break
-                    
-                    # Update activity time if either query is active
-                    if query_topic1.isActive or query_topic2.isActive:
-                        last_active_time = time.time()
-                    
-                    # Check for idle timeout
-                    if time.time() - last_active_time > idle_timeout:
-                        print(f"[SPARK-ChromaDB] Idle timeout reached ({idle_timeout}s). Stopping.")
-                        break
-                    
-                    # Periodic garbage collection
-                    if time.time() - last_gc_time > gc_interval:
-                        print("[SPARK-ChromaDB] Running garbage collection")
-                        gc.collect()
-                        last_gc_time = time.time()
-                
-                # Stop queries gracefully
-                print("[SPARK-ChromaDB] Stopping streaming queries...")
-                query_topic1.stop()
-                query_topic2.stop()
-                print("[SPARK-ChromaDB] All streaming queries stopped")
-                
-            except KeyboardInterrupt:
-                print("[SPARK-ChromaDB] KeyboardInterrupt received, stopping queries...")
-                query_topic1.stop()
-                query_topic2.stop()
-            except Exception as e:
-                print(f"[SPARK-ChromaDB] Error during execution: {e}")
-                import traceback
-                traceback.print_exc()
-                query_topic1.stop()
-                query_topic2.stop()
-            finally:
-                # Close pipeline and ChromaDB connection
+def _upsert_payloads(raw_frame, payloads_json: str, classifier: ChromaDBVehicleReID_spark):
+    VEHICLE_LABELS = {0: 'motorcycle', 1: 'car', 2: 'truck', 3: 'bus'}
+    if not payloads_json or payloads_json == "[]":
+        return raw_frame
+    try:
+        payloads = json.loads(payloads_json)
+    except json.JSONDecodeError as decode_error:
+        print(f"[Payload] JSON decode error: {decode_error}")
+        return raw_frame
+    annotated_frame = raw_frame
+    for payload in payloads:
+        try:
+            encoded = payload.get("image")
+            decoded_image = None
+            if encoded:
                 try:
-                    # Release resources from pipeline
-                    if _shared_pipeline:
-                        # First close ChromaDB connection
-                        if hasattr(_shared_pipeline, 'classifier'):
-                            if hasattr(_shared_pipeline.classifier, 'close'):
-                                try:
-                                    _shared_pipeline.classifier.close()
-                                    print("[SPARK-ChromaDB] ChromaDB connection closed")
-                                except Exception as e:
-                                    print(f"[SPARK-ChromaDB] Warning: Error closing ChromaDB: {e}")
-                        
-                        # Release other resources
-                        if hasattr(_shared_pipeline, 'detector'):
-                            _shared_pipeline.detector = None
-                        if hasattr(_shared_pipeline, 'descriptor'):
-                            _shared_pipeline.descriptor = None
-                        
-                        # Reset pipeline reference
-                        _shared_pipeline = None
-                        
-                    # Force explicit garbage collection
-                    print("[SPARK-ChromaDB] Running final garbage collection")
-                    gc.collect()
-                    
-                    # Stop Spark session
-                    spark.stop()
-                    print("[SPARK-ChromaDB] Spark session stopped")
-                    
-                except Exception as e:
-                    print(f"[SPARK-ChromaDB] Error during cleanup: {e}")
-                    traceback.print_exc()
-                
-        except Exception as e:
-            print(f"[SPARK] Fatal error in streaming thread: {e}")
-            import traceback
-            traceback.print_exc()
-            if 'spark' in locals():
-                spark.stop()
-            print("[SPARK] Spark session stopped due to error")
+                    img_bytes = base64.b64decode(encoded)
+                    img_buffer = np.frombuffer(img_bytes, dtype=np.uint8)
+                    decoded_image = cv2.imdecode(img_buffer, cv2.IMREAD_COLOR)
+                except Exception as decode_err:
+                    print(f"[Payload] Image decode error: {decode_err}")
+            feature = torch.tensor(payload.get("feature", []), dtype=torch.float32)
+            vehicle_id = classifier.identify(
+                target=feature,
+                vehicle_type=int(payload.get("vehicle_type")),
+                confidence=float(payload.get("confidence")),
+                do_update=True,
+                image=decoded_image,
+                camera_id=payload.get("camera_id"),
+                track_id=payload.get("track_id"),
+                timestamp=payload.get("timestamp"),
+            )
 
-    thread = threading.Thread(target=spark_streaming_thread)
-    thread.start()
-    return thread
+            camera_matches = classifier.get_cross_camera_matches(vehicle_id, payload.get("vehicle_type"))
+            if len(camera_matches) > 1:
+                vehicle_key = (payload.get("camera_id"), vehicle_id)
+                vehicle_type_id = int(payload.get("vehicle_type"))
+                vehicle_label = VEHICLE_LABELS.get(vehicle_type_id, f"class_{vehicle_type_id}")
+                print(f"CROSS-CAMERA MATCH! Vehicle ID: {vehicle_id} ({vehicle_label}) found in cameras: {list(camera_matches.keys())}")
+            
+                if vehicle_key not in _processed_cross_camera:
+                    classifier.save_cross_camera_images(vehicle_id, payload.get("vehicle_type"), camera_matches, save_dir="Vehicle-Re-ID/matching_exports_2")
+                    _processed_cross_camera.add(vehicle_key)
+            vehicle_type = VEHICLE_LABELS.get(int(payload.get("vehicle_type")), f"class_{payload.get('vehicle_type')}")
+            label = f"ID: {vehicle_id} ({vehicle_type})"
+            unique_color = color.create_unique_color(vehicle_id)
+            cv2.rectangle(
+                    img=annotated_frame,
+                    pt1=(payload.get("bbox")[0], payload.get("bbox")[1]),
+                    pt2=(payload.get("bbox")[2], payload.get("bbox")[3]),
+                    color=unique_color,
+                    thickness=2,
+                )
+            cv2.putText(
+                img=annotated_frame,
+                text=label,
+                org=(payload.get("bbox")[0], payload.get("bbox")[1] - 5),
+                fontFace=cv2.FONT_HERSHEY_SIMPLEX,
+                fontScale=0.6,
+                color=unique_color,
+                thickness=2,
+            )
+        except Exception as upsert_error:
+            print(f"[Payload] Upsert error: {upsert_error}")
+    return annotated_frame
+
+def start_spark_streaming(args=None, base_dir=None, progress_callback=None, session_metrics=None):
+    global _model_state_bc, _shared_model, _kafka_producer, _processed_cross_camera
+    try:
+        findspark.init()
+        SCALA_VERSION = '2.13'
+        SPARK_VERSION = '4.0.0'
+        KAFKA_VERSION = '3.5.0'
+        
+        print(f"Starting Spark Streaming for Vehicle Re-ID...")
+        
+        packages = [
+            f'org.apache.spark:spark-sql-kafka-0-10_{SCALA_VERSION}:{SPARK_VERSION}',
+            f'org.apache.kafka:kafka-clients:{KAFKA_VERSION}'
+        ]
+
+        spark = SparkSession.builder \
+            .master('local[4]') \
+            .appName(f"vehicle-reid") \
+            .config("spark.jars.packages", ",".join(packages)) \
+            .config("spark.sql.adaptive.enabled", "false") \
+            .config("spark.sql.execution.pyspark.udf.faulthandler.enabled", "true") \
+            .config("spark.python.worker.faulthandler.enabled", "true") \
+            .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer") \
+            .config("spark.python.worker.memory", "3g") \
+            .config("spark.driver.memory", "2g") \
+            .config("spark.dynamicAllocation.enabled", "false") \
+            .config("spark.executor.memory", "3g") \
+            .config("spark.python.worker.reuse", "true") \
+            .getOrCreate()
+        
+        print("[SPARK] Session created successfully")
+        base_dir = Path(base_dir or Path(__file__).resolve().parents[1])
+
+        detector = VehicleDetector(model_path=str(base_dir / "best_20.pt"))
+        descriptor = VehicleDescriptor(model_type='osnet', model_path=str(base_dir / "best_osnet_model.pth"))
+        pipeline = Pipeline_spark(detector=detector, descriptor=descriptor)
+        print(f"[Driver] Pipeline initialized once. Pid={os.getpid()}")
+
+        listener = None
+        if progress_callback:
+            class _MetricsListener(StreamingQueryListener):
+                def onQueryStarted(self_inner, event):
+                    pass
+
+                def onQueryTerminated(self_inner, event):
+                    pass
+
+                def onQueryProgress(self_inner, event):
+                    try:
+                        progress = event.progress
+                        duration_ms = None
+                        if progress.durationMs:
+                            duration_ms = progress.durationMs.get('addBatch') or progress.durationMs.get('getBatch')
+                        payload = {
+                            "batch_id": progress.batchId,
+                            "num_input_rows": progress.numInputRows,
+                            "processed_rows_per_second": progress.processedRowsPerSecond,
+                            "duration_ms": duration_ms,
+                        }
+                        progress_callback(payload)
+                    except Exception as callback_error:
+                        print(f"[SPARK] Metrics callback error: {callback_error}")
+
+            listener = _MetricsListener()
+            spark.streams.addListener(listener)
+        
+        kafka_params = {
+            "kafka.bootstrap.servers": "localhost:9092",
+            "subscribe": f"cam1, cam2",
+            "maxOffsetsPerTrigger": "100",  
+            "fetchOffset.numRetries": "2",  
+            "kafka.consumer.fetch.max.bytes": "52428800",  
+            "kafka.fetch.message.max.bytes": "52428800",  
+            "fetchOffset.retryIntervalMs": "1000",
+            "kafka.session.timeout.ms": "30000",
+            "kafka.request.timeout.ms": "40000",
+            "kafka.max.poll.interval.ms": "300000"
+        }
+        
+        print(f"[SPARK] Kafka parameters: {kafka_params}")
+
+        print(f"[SPARK] Creating streaming DataFrame...")
+        df = spark.readStream \
+            .format("kafka") \
+            .options(**kafka_params) \
+            .option("startingOffsets", "latest") \
+            .load()
+        
+        print(f"[SPARK] Streaming DataFrame created")
+        
+        df = df.withColumn("value", df["value"].cast(BinaryType()))
+    
+        checkpoint_base = Path(base_dir) / "tmp" if base_dir else Path("tmp")
+        checkpoint_base.mkdir(exist_ok=True)
+
+        checkpoint_dir = checkpoint_base / (f"chromadb_checkpoint")
+        if checkpoint_dir.exists():
+            try:
+                shutil.rmtree(checkpoint_dir)
+                print(f"[SPARK-ChromaDB] Cleaned up old checkpoint directory: {checkpoint_dir}")
+            except Exception as e:
+                print(f"[SPARK-ChromaDB] Warning: Could not clean checkpoint dir {checkpoint_dir}: {e}")
+
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        
+
+        db_root = Path(base_dir) if base_dir else Path(__file__).resolve().parents[2]
+        classifier = ChromaDBVehicleReID_spark(
+            db_path=str(db_root / "chroma_vehicle_reid_streaming"),
+            collection_name="vehicle_embeddings_streaming"
+        )
+        print("[ChromaDB] Connected for batch upserts")
+
+        encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), 80]
+
+        stats_start_ts = time.time()
+        per_camera_totals = {
+            "cam1": {"processed": 0, "latency_ms_sum": 0.0},
+            "cam2": {"processed": 0, "latency_ms_sum": 0.0},
+        }
+
+        per_camera_times = {
+            "cam1": {
+                "first_capture_ts_ms": None,
+                "last_capture_ts_ms": None,
+                "first_spark_output_ts_ms": None,
+                "last_spark_output_ts_ms": None,
+            },
+            "cam2": {
+                "first_capture_ts_ms": None,
+                "last_capture_ts_ms": None,
+                "first_spark_output_ts_ms": None,
+                "last_spark_output_ts_ms": None,
+            },
+        }
+        def process_result_batch(batch_df, batch_id):
+            print(f"[ForeachBatch] Handling batch {batch_id}")
+            producer = get_or_create_kafka_producer()
+            try:
+                
+                batch_per_camera = {
+                    "cam1": {"processed": 0, "latency_ms_sum": 0.0},
+                    "cam2": {"processed": 0, "latency_ms_sum": 0.0},
+                }
+                batch_duration_s = 0.0
+                for row in batch_df.selectExpr(
+                    "CAST(topic AS STRING) as topic",
+                    "CAST(key AS STRING) as key",
+                    "value",
+                    "timestamp",
+                ).toLocalIterator():
+                    camera_id = _resolve_camera_from_topic(row.topic)
+
+                    capture_ts_ms = _parse_capture_ts_ms_from_key(getattr(row, "key", None))
+                    if camera_id in per_camera_times and capture_ts_ms is not None:
+                        t = per_camera_times[camera_id]
+                        if t["first_capture_ts_ms"] is None or capture_ts_ms < t["first_capture_ts_ms"]:
+                            t["first_capture_ts_ms"] = capture_ts_ms
+                        if t["last_capture_ts_ms"] is None or capture_ts_ms > t["last_capture_ts_ms"]:
+                            t["last_capture_ts_ms"] = capture_ts_ms
+
+                    frame_bytes = bytes(row.value) if isinstance(row.value, (bytearray, memoryview)) else row.value
+                    if frame_bytes is None:
+                        continue
+
+                    image = cv2.imdecode(np.frombuffer(frame_bytes, np.uint8), cv2.IMREAD_COLOR)
+                    if image is None:
+                        continue
+
+                    batch_start_ts = time.time()
+                    pipeline_result = pipeline.process(image, camera_id=camera_id)
+                    batch_duration_s = batch_duration_s + max(1e-6, time.time() - batch_start_ts)
+                    if isinstance(pipeline_result, tuple) and len(pipeline_result) == 2:
+                        raw_frame, payloads = pipeline_result
+                    else:
+                        raw_frame, payloads = image, pipeline_result
+
+                    if raw_frame is None or getattr(raw_frame, "size", 0) == 0:
+                        raw_frame = image
+
+                    try:
+                        now_s = time.time()
+                        kafka_ts = row.timestamp
+                        if capture_ts_ms is not None:
+                            e2e_latency_ms = (now_s * 1000.0) - float(capture_ts_ms)
+                        elif kafka_ts is not None:
+                            e2e_latency_ms = (now_s - kafka_ts.timestamp()) * 1000.0
+                        else:
+                            e2e_latency_ms = None
+
+                        if e2e_latency_ms is not None:
+                            if camera_id in batch_per_camera:
+                                batch_per_camera[camera_id]["processed"] += 1
+                                batch_per_camera[camera_id]["latency_ms_sum"] += e2e_latency_ms
+                                per_camera_totals[camera_id]["processed"] += 1
+                                per_camera_totals[camera_id]["latency_ms_sum"] += e2e_latency_ms
+                    except Exception:
+                        pass
+                         
+                    payloads_json = _serialize_payloads(payloads)
+                    annotated_image = _upsert_payloads(raw_frame, payloads_json, classifier)
+
+                    # Guard against OpenCV assertion failures on empty images.
+                    if annotated_image is None or getattr(annotated_image, "size", 0) == 0:
+                        annotated_image = raw_frame
+                    if annotated_image is None or getattr(annotated_image, "size", 0) == 0:
+                        continue
+
+                    success, buffer = cv2.imencode('.jpg', annotated_image, encode_params)
+                    if success:
+                        spark_out_ts_ms = time.time() * 1000.0
+                        if camera_id in per_camera_times:
+                            t = per_camera_times[camera_id]
+                            if t["first_spark_output_ts_ms"] is None or spark_out_ts_ms < t["first_spark_output_ts_ms"]:
+                                t["first_spark_output_ts_ms"] = spark_out_ts_ms
+                            if t["last_spark_output_ts_ms"] is None or spark_out_ts_ms > t["last_spark_output_ts_ms"]:
+                                t["last_spark_output_ts_ms"] = spark_out_ts_ms
+                        producer.send(f"{camera_id}_processed", value=buffer.tobytes())
+                producer.flush()
+
+                if progress_callback:
+                    try:
+                        progress_callback(
+                            {
+                                "type": "per_camera_metrics",
+                                "batch_id": batch_id,
+                                "batch_duration_s": batch_duration_s,
+                                "per_camera": {
+                                    cam: {
+                                        "batch_processed": batch_per_camera[cam]["processed"],
+                                        "batch_mean_e2e_latency_ms": (
+                                            (batch_per_camera[cam]["latency_ms_sum"] / batch_per_camera[cam]["processed"])
+                                            if batch_per_camera[cam]["processed"]
+                                            else None
+                                        ),
+                                        "total_processed": per_camera_totals[cam]["processed"],
+                                        "total_mean_e2e_latency_ms": (
+                                            (per_camera_totals[cam]["latency_ms_sum"] / per_camera_totals[cam]["processed"])
+                                            if per_camera_totals[cam]["processed"]
+                                            else None
+                                        ),
+                                        "first_capture_ts_ms": per_camera_times[cam]["first_capture_ts_ms"],
+                                        "last_capture_ts_ms": per_camera_times[cam]["last_capture_ts_ms"],
+                                        "first_spark_output_ts_ms": per_camera_times[cam]["first_spark_output_ts_ms"],
+                                        "last_spark_output_ts_ms": per_camera_times[cam]["last_spark_output_ts_ms"],
+                                    }
+                                    for cam in ("cam1", "cam2")
+                                },
+                            }
+                        )
+                    except Exception as callback_error:
+                        print(f"[SPARK] Metrics callback error: {callback_error}")
+
+                print(f"[ForeachBatch] Finished batch {batch_id} of {batch_df.count()} frames, time: {batch_duration_s:.2f}s")
+            except Exception as batch_error:
+                print(f"[ForeachBatch] Error: {batch_error}")
+                traceback.print_exc()
+                producer.flush()
+
+        query = df.writeStream \
+            .foreachBatch(process_result_batch) \
+            .option("checkpointLocation", str(checkpoint_dir)) \
+            .trigger(processingTime="8 seconds") \
+            .start()
+        gc.collect()
+        query.awaitTermination()
+
+    except Exception as e:
+        print(f"[SPARK] ERROR creating Spark session: {e}")
+        traceback.print_exc()
+        gc.collect()
+        return None
+    finally:
+        close_kafka_producer()

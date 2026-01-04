@@ -1,19 +1,23 @@
 import cv2
 import os
 import gc
+import time
 from modules.vehicle_detection import VehicleDetector
 from modules.feature_extraction import VehicleDescriptor
 from modules.reid_chromadb import ChromaDBVehicleReID
 from modules.pipeline import Pipeline
 
-def run_reid(video_path1, video_path2, 
-                                   save_dir=None, 
-                                   db_path="./chroma_vehicle_reid",
-                                   process_every_n_frames=5,
-                                   reset_database=False):
+def run_reid(
+    video_path1,
+    video_path2,
+    save_dir=None,
+    db_path="./chroma_vehicle_reid",
+    process_every_n_frames=5,
+    reset_database=False,
+):
     # Initialize components with ChromaDB
-    detector = VehicleDetector(model_path='checkpoints/best_20.pt')
-    descriptor = VehicleDescriptor(model_type='osnet', model_path='checkpoints/best_osnet_model.pth')
+    detector = VehicleDetector(model_path='best_20.pt')
+    descriptor = VehicleDescriptor(model_type='osnet', model_path='best_osnet_model.pth')
     classifier = ChromaDBVehicleReID(db_path=db_path)
     
     # Reset database if requested
@@ -73,7 +77,14 @@ def run_reid(video_path1, video_path2,
         out2 = cv2.VideoWriter(output_path2, fourcc, fps2//process_every_n_frames, (width2, height2))
 
     frame_count = 0
+    processed_cam1 = 0
+    processed_cam2 = 0
+    latency_total_cam1 = 0.0
+    latency_total_cam2 = 0.0
+    fps_sum_cam1 = 0.0
+    fps_sum_cam2 = 0.0
     try:
+        start_time = time.time()
         while True:
             ret1, frame1 = cap1.read()
             ret2, frame2 = cap2.read()
@@ -88,7 +99,13 @@ def run_reid(video_path1, video_path2,
                         frame1 = cv2.resize(frame1, (width1, height1))
                     
                     # Process frame
+                    frame_start = time.perf_counter()
                     result1 = pipeline.process(frame1, 'cam1')
+                    frame_latency_ms = (time.perf_counter() - frame_start) * 1000.0
+                    processed_cam1 += 1
+                    latency_total_cam1 += frame_latency_ms
+                    fps = 1000.0 / frame_latency_ms if frame_latency_ms > 0 else 0.0
+                    fps_sum_cam1 += fps
                     if save_dir and result1 is not None:
                         out1.write(result1)
                     
@@ -101,7 +118,13 @@ def run_reid(video_path1, video_path2,
                         frame2 = cv2.resize(frame2, (width2, height2))
                     
                     # Process frame
+                    frame_start = time.perf_counter()
                     result2 = pipeline.process(frame2, 'cam2')
+                    frame_latency_ms = (time.perf_counter() - frame_start) * 1000.0
+                    processed_cam2 += 1
+                    latency_total_cam2 += frame_latency_ms
+                    fps = 1000.0 / frame_latency_ms if frame_latency_ms > 0 else 0.0
+                    fps_sum_cam2 += fps
                     if save_dir and result2 is not None:
                         out2.write(result2)
                     
@@ -117,7 +140,9 @@ def run_reid(video_path1, video_path2,
                         print(f"Current database size: {current_stats['total']} embeddings")
 
             frame_count += 1
-
+        end_time = time.time()
+        total_time = end_time - start_time
+        print(f"Latency: {total_time:.2f} seconds")
     except Exception as e:
         print(f"Error during processing: {e}")
     finally:
@@ -137,13 +162,43 @@ def run_reid(video_path1, video_path2,
                 print(f"  {vehicle_type}: {count} embeddings")
         print(f"Total: {final_stats['total']} embeddings")
         print(f"Max IDs: {final_stats['max_ids']}")
-        
+
+        def _print_means_2(processed: int, latency_total_ms: float, fps_sum: float, label: str):
+            if not processed or latency_total_ms <= 0:
+                print(f"{label} had no processed frames; skipping mean stats.")
+                return
+            mean_latency = latency_total_ms / processed
+            mean_fps = 1000 / mean_latency if mean_latency > 0 else 0.0
+            print("-"*30, "Cách 2", "-"*30)
+            print("-"*20, label, "-"*20)
+            print(f"{label} mean latency: {mean_latency:.2f} ms")
+            print(f"{label} mean FPS: {mean_fps:.2f}")
+
+        def _print_means_3(processed: int, latency_total_ms: float, fps_sum: float, label: str):
+            if not processed or latency_total_ms <= 0:
+                print(f"{label} had no processed frames; skipping mean stats.")
+                return
+            mean_latency = latency_total_ms / processed
+            mean_fps = (processed * 1000) / latency_total_ms if mean_latency > 0 else 0.0
+            print("-"*30, "Cách 3", "-"*30)
+            print("-"*20, label, "-"*20)
+            print(f"{label} mean latency: {mean_latency:.2f} ms")
+            print(f"{label} mean FPS: {mean_fps:.2f}")
+
+        _print_means_2(processed_cam1, latency_total_cam1, fps_sum_cam1, "Cam1")
+        _print_means_2(processed_cam2, latency_total_cam2, fps_sum_cam2, "Cam2")
+
+        _print_means_3(processed_cam1, latency_total_cam1, fps_sum_cam1, "Cam1")
+        _print_means_3(processed_cam2, latency_total_cam2, fps_sum_cam2, "Cam2")
+
+
+
         # Close pipeline
         pipeline.close()
 
 if __name__ == "__main__":
-    video1 = "data/cam1.mp4"
-    video2 = "data/cam2_full.mp4"
+    video1 = r"D:\Khoa\University\3rdYear\BigData\Cam_1.mp4"
+    video2 = r"D:\Khoa\University\3rdYear\BigData\Cam_2.mp4"
     output_dir = "results"
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)

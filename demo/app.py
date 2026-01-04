@@ -12,7 +12,7 @@ import threading
 import cv2
 import numpy as np
 from datetime import datetime
-from typing import Dict
+from typing import Dict, Optional
 import shutil
 from pathlib import Path
 import base64
@@ -24,11 +24,172 @@ import numpy as np
 import gc
 import traceback
 
+# Add the parent directory to Python path to import custom modules
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 # Global queue for WebSocket messages
 websocket_queue = Queue()
 
+
+class SessionMetrics:
+    def __init__(self, session_id: str):
+        self.lock = threading.Lock()
+        self.session_id = session_id
+        self.camera_metrics = {
+            "cam1": {
+                "fps_sum": 0.0,
+                "fps_count": 0,
+                "latency_sum": 0.0,
+                "latency_count": 0,
+                "frame_count": 0,
+            },
+            "cam2": {
+                "fps_sum": 0.0,
+                "fps_count": 0,
+                "latency_sum": 0.0,
+                "latency_count": 0,
+                "frame_count": 0,
+            },
+        }
+
+        # Spark-side capture->Spark-output metrics (separate from true e2e).
+        self.spark_camera_metrics = {
+            "cam1": {"frame_count": 0, "latency_sum": 0.0, "latency_count": 0},
+            "cam2": {"frame_count": 0, "latency_sum": 0.0, "latency_count": 0},
+        }
+
+        self.spark_run_start: Optional[float] = None
+        self.spark_run_end: Optional[float] = None
+        self.spark_batch_count = 0
+
+    def record_frame_latency(self, latency_ms: float, camera: Optional[str] = None):
+        if latency_ms is None or camera not in self.camera_metrics:
+            return
+        with self.lock:
+            stats = self.camera_metrics[camera]
+            stats["latency_sum"] += latency_ms
+            stats["latency_count"] += 1
+
+    def record_frame_sent(self, camera: Optional[str] = None):
+        if camera not in self.camera_metrics:
+            return
+        with self.lock:
+            self.camera_metrics[camera]["frame_count"] += 1
+
+    def record_spark_frame_metrics(self, camera: Optional[str], latency_ms: Optional[float] = None):
+        if camera not in self.spark_camera_metrics:
+            return
+        with self.lock:
+            stats = self.spark_camera_metrics[camera]
+            stats["frame_count"] += 1
+            if latency_ms is not None:
+                stats["latency_sum"] += float(latency_ms)
+                stats["latency_count"] += 1
+
+    def record_frontend_fps(self, camera: str, fps: float):
+        if not fps or camera not in self.camera_metrics:
+            return
+        with self.lock:
+            stats = self.camera_metrics[camera]
+            stats["fps_sum"] += fps
+            stats["fps_count"] += 1
+
+    def start_spark_run(self):
+        with self.lock:
+            if self.spark_run_start is None:
+                self.spark_run_start = time.time()
+                self.spark_run_end = None
+
+    def stop_spark_run(self):
+        with self.lock:
+            if self.spark_run_start is not None:
+                self.spark_run_end = time.time()
+
+    def record_micro_batch(self, progress: dict):
+        if not progress:
+            return
+        with self.lock:
+            self.spark_batch_count += 1
+
+    def compute_summary(self):
+        with self.lock:
+            cameras = {}
+            spark_cameras = {}
+            for camera, stats in self.camera_metrics.items():
+                mean_fps = (stats["fps_sum"] / stats["fps_count"]) if stats["fps_count"] else None
+                mean_latency_ms = (stats["latency_sum"] / stats["latency_count"]) if stats["latency_count"] else None
+                cameras[camera] = {
+                    # Mean FPS is computed from measured FPS samples.
+                    "mean_fps": mean_fps,
+                    # True end-to-end latency (capture -> websocket send).
+                    "total_mean_e2e_latency_ms": mean_latency_ms,
+                    "fps_samples": stats["fps_count"],
+                    "latency_samples": stats["latency_count"],
+                    "total_processed": stats.get("frame_count", 0),
+                }
+
+            if self.spark_run_start is None:
+                spark_time = None
+            else:
+                end_time = self.spark_run_end or time.time()
+                spark_time = max(0.0, end_time - self.spark_run_start)
+            spark_batches = self.spark_batch_count
+
+            # Add runtime-based mean e2e FPS (like main_stream.py).
+            if spark_time and spark_time > 0:
+                for camera in cameras.keys():
+                    total = cameras[camera].get("total_processed") or 0
+                    cameras[camera]["mean_e2e_fps"] = float(total) / float(spark_time)
+            else:
+                for camera in cameras.keys():
+                    cameras[camera]["mean_e2e_fps"] = None
+
+            # Spark-side capture->Spark-output metrics.
+            for camera, stats in self.spark_camera_metrics.items():
+                mean_spark_latency_ms = (stats["latency_sum"] / stats["latency_count"]) if stats["latency_count"] else None
+                spark_cameras[camera] = {
+                    "total_processed": stats.get("frame_count", 0),
+                    "total_mean_e2e_latency_ms": mean_spark_latency_ms,
+                }
+            if spark_time and spark_time > 0:
+                for camera in spark_cameras.keys():
+                    total = spark_cameras[camera].get("total_processed") or 0
+                    spark_cameras[camera]["mean_e2e_fps"] = float(total) / float(spark_time)
+            else:
+                for camera in spark_cameras.keys():
+                    spark_cameras[camera]["mean_e2e_fps"] = None
+
+        return {
+            "cameras": cameras,
+            "spark_cameras": spark_cameras,
+            "spark_runtime_sec": spark_time,
+            "spark_batches": spark_batches,
+        }
+
+    def print_summary(self, prefix: Optional[str] = None):
+        summary = self.compute_summary()
+        header = prefix or f"Session {self.session_id} metrics"
+        divider = "-" * 30
+        print(f"\n{divider} {header} {divider}")
+        for camera, stats in summary["cameras"].items():
+            print(
+                f"{camera.upper()}"
+                f"mean_e2e_fps={stats.get('mean_e2e_fps') if stats.get('mean_e2e_fps') is not None else 'n/a'}, "
+                f"mean_e2e_latency_ms={stats.get('total_mean_e2e_latency_ms') if stats.get('total_mean_e2e_latency_ms') is not None else 'n/a'}"
+            )
+
+        spark_cam = summary.get("spark_cameras") or {}
+        if spark_cam:
+            for camera, stats in spark_cam.items():
+                print(
+                    f"{camera.upper()} spark: total={stats.get('total_processed')}, "
+                    f"mean_e2e_fps={stats.get('mean_e2e_fps') if stats.get('mean_e2e_fps') is not None else 'n/a'}, "
+                    f"mean_e2e_latency_ms={stats.get('total_mean_e2e_latency_ms') if stats.get('total_mean_e2e_latency_ms') is not None else 'n/a'}"
+                )
+        print(divider * 2)
+
+
 def ensure_kafka_topic(session_id, bootstrap_servers):
-    """Check if a Kafka topic exists, and create it if not."""
     admin_client = KafkaAdminClient(bootstrap_servers=bootstrap_servers)
     existing_topics = admin_client.list_topics()
     topic_names = [f'cam1_{session_id}', f'cam2_{session_id}' ,f'cam1_processed_{session_id}', f'cam2_processed_{session_id}']
@@ -41,26 +202,18 @@ def ensure_kafka_topic(session_id, bootstrap_servers):
                 print(f"Error creating topic {topic_name}: {e}")
         else:
             print(f"Kafka topic already exists: {topic_name}")
-            # Return a consumer for the topic
     admin_client.close()
-
-# Add the parent directory to Python path to import custom modules
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from streaming.spark_streaming import start_spark
 from streaming.kafka_producer import VideoProducer
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Capture the main event loop on startup."""
     print(BASE_DIR)
     app.main_loop = asyncio.get_running_loop()
-    # Start a background task to process the WebSocket message queue
     app.main_loop.create_task(process_websocket_queue())
     yield
-    """Shutdown event handler"""
     print("[FastAPI] Shutting down...")
     
-    # Clean up all active sessions
     for session_id in list(active_sessions.keys()):
         await stop_processing(session_id)
 app = FastAPI(title="Vehicle Re-ID Demo", 
@@ -68,7 +221,6 @@ app = FastAPI(title="Vehicle Re-ID Demo",
               description="A demo application for Vehicle Re-Identification using FastAPI, Kafka, and Spark Streaming",
               lifespan=lifespan)
 
-# Store the main event loop
 app.main_loop = None
 
     
@@ -89,7 +241,6 @@ websocket_connections: Dict[str, WebSocket] = {}
 # Build paths relative to the script's location
 BASE_DIR = Path(__file__).resolve().parent
 
-# Create necessary directories
 (BASE_DIR / "uploads").mkdir(exist_ok=True)
 (BASE_DIR.parent / "matching").mkdir(exist_ok=True)
 (BASE_DIR / "static").mkdir(exist_ok=True)
@@ -131,25 +282,19 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 async def process_websocket_queue():
-    """Process messages from the global queue and send them to the correct WebSocket.
-    Optimized for memory efficiency and to handle queue backlog situations."""
     print("[WebSocket Processor] Starting...")
     loop = asyncio.get_running_loop()
     
-    # Track processing statistics
     processed_count = 0
     last_stats_time = time.time()
-    stats_interval = 60  # Report stats every minute
+    stats_interval = 60  
     
     while True:
         try:
-            # Get current queue size for monitoring
             queue_size = websocket_queue.qsize()
             
-            # Handle backlog situation - drop old frames if queue gets too big
-            if queue_size > 180:  # If more than 30 frames are queued (5 seconds at 6 FPS)
+            if queue_size > 180: 
                 print(f"[WebSocket Processor] WARNING: Queue backlog detected ({queue_size} items). Clearing old frames...")
-                # Keep only the most recent 5 frames for each session
                 session_frames = {}
                 discarded = 0
                 
@@ -158,7 +303,6 @@ async def process_websocket_queue():
                     try:
                         session_id, message = websocket_queue.get_nowait()
                         if message.get("type") == "frame":
-                            # Keep only most recent frames per session/camera
                             key = f"{session_id}_{message.get('camera', 'unknown')}"
                             if key not in session_frames:
                                 session_frames[key] = []
@@ -166,52 +310,51 @@ async def process_websocket_queue():
                             websocket_queue.task_done()
                             discarded += 1
                         else:
-                            # Re-add non-frame messages
                             websocket_queue.put((session_id, message))
                             websocket_queue.task_done()
                     except Exception:
                         break
                 
-                # Re-add only the 2 most recent frames per session/camera
                 for key, frames in session_frames.items():
-                    # Sort by frame count if available
                     frames.sort(key=lambda x: x[1].get("frame_count", 0), reverse=True)
-                    # Add back the 2 most recent frames
                     for i, (session_id, message) in enumerate(frames[:2]):
                         websocket_queue.put((session_id, message))
                 
                 print(f"[WebSocket Processor] Cleared queue backlog. Discarded {discarded} items, kept {sum(len(frames[:2]) for frames in session_frames.values())}.")
             
-            # Normal processing - get message from the queue
             try:
-                # Use a timeout to prevent blocking indefinitely
                 session_id, message = await loop.run_in_executor(
                     None, lambda: websocket_queue.get(timeout=0.5)
                 )
                 
-                # Send the message if the connection is still active
                 if session_id in manager.active_connections:
-                    # Convert to JSON string once
+                    if message.get("type") == "frame":
+                        capture_ts_ms = message.get("capture_ts_ms")
+                        camera = message.get("camera")
+                        session_metrics = active_sessions.get(session_id, {}).get("metrics")
+                        if session_metrics and camera:
+                            session_metrics.record_frame_sent(camera)
+                        if isinstance(capture_ts_ms, (int, float)) and camera:
+                            latency_ms = (time.time() * 1000.0) - float(capture_ts_ms)
+                            if session_metrics:
+                                session_metrics.record_frame_latency(latency_ms, camera)
+
                     message_json = json.dumps(message)
                     await manager.send_personal_message(message_json, session_id)
                     processed_count += 1
                 else:
-                    # Connection not active, silently discard
                     pass
                 
-                # Mark as done
                 websocket_queue.task_done()
                 
                 # Free memory
                 del message
                 
             except asyncio.CancelledError:
-                # Task was cancelled, exit gracefully
                 print("[WebSocket Processor] Task cancelled, shutting down...")
                 return
             except Exception as e:
-                # Could be queue.Empty or other exception
-                await asyncio.sleep(0.1)  # Short sleep if no messages
+                await asyncio.sleep(0.1) 
             
             # Print stats periodically
             current_time = time.time()
@@ -222,11 +365,9 @@ async def process_websocket_queue():
                 
         except Exception as e:
             print(f"[WebSocket Processor] Error in main loop: {e}")
-            # In case of an error, sleep a bit before retrying
             await asyncio.sleep(1)
 
 def kafka_consumer_thread(session_id: str, camera: str):
-    """Thread function to consume processed frames from a specific camera"""
     topic = f'{camera}_processed_{session_id}'
     print(f"[Kafka Consumer {camera.upper()}] Starting consumer thread for session {session_id}")
     
@@ -238,19 +379,19 @@ def kafka_consumer_thread(session_id: str, camera: str):
             bootstrap_servers=['localhost:9092'],    
             value_deserializer=None,
             key_deserializer=None,
-            fetch_max_bytes=52428800,       # 50MB
-            max_in_flight_requests_per_connection=5,  # Reduced from 10
-            fetch_max_wait_ms=500,          # Further reduced for responsiveness
+            fetch_max_bytes=52428800,       
+            max_in_flight_requests_per_connection=5,  
+            fetch_max_wait_ms=500,          
             fetch_min_bytes=1,              
-            consumer_timeout_ms=2000,       # Increased timeout
+            consumer_timeout_ms=2000,       
             auto_offset_reset='latest',
             enable_auto_commit=True,
-            auto_commit_interval_ms=1000,   # Auto-commit every second
-            receive_buffer_bytes=67108864,  # 64MB
-            session_timeout_ms=30000,       # Increased session timeout
-            heartbeat_interval_ms=3000,     # Heartbeat every 3 seconds
-            max_poll_records=10,            # Limit records per poll
-            max_poll_interval_ms=300000,    # 5 minutes max poll interval
+            auto_commit_interval_ms=1000,   
+            receive_buffer_bytes=67108864,  
+            session_timeout_ms=30000,       
+            heartbeat_interval_ms=3000,     
+            max_poll_records=10,            
+            max_poll_interval_ms=300000,    
             group_id=f'demo_consumer_{camera}_{session_id}_{int(time.time())}'
         )
         
@@ -262,49 +403,55 @@ def kafka_consumer_thread(session_id: str, camera: str):
         frame_interval = 1.0 / target_fps
         print(f"[Kafka Consumer {camera.upper()}] Starting to consume messages at {target_fps} FPS...")
         
-        # Improved timeout handling
+        
         consecutive_timeouts = 0
-        max_consecutive_timeouts = 100  # Reduced from 10000
+        max_consecutive_timeouts = 100 
         
         while consecutive_timeouts < max_consecutive_timeouts:
             try:
-                # Check if session is still active first
+               
                 if session_id not in active_sessions:
                     print(f"[Kafka Consumer {camera.upper()}] Session {session_id} no longer active, stopping consumer")
                     break
                 
-                # Get message with better timeout handling
-                message_batch = consumer.poll(timeout_ms=2000)  # Increased timeout
+                
+                message_batch = consumer.poll(timeout_ms=2000)  
                 
                 if not message_batch:
                     consecutive_timeouts += 1
-                    if consecutive_timeouts % 10 == 0:  # Log every 10 timeouts
+                    if consecutive_timeouts % 10 == 0:  
                         print(f"[Kafka Consumer {camera.upper()}] No messages received (timeout {consecutive_timeouts}/{max_consecutive_timeouts})")
-                    time.sleep(0.1)  # Slightly longer sleep
+                    time.sleep(0.1)  
                     continue
                 
-                # Reset timeout counter on successful message
                 consecutive_timeouts = 0
                 
-                # Process messages with frame rate control
                 for topic_partition, messages in message_batch.items():
                     for message in messages:
-                        # Frame rate control
                         current_time = time.time()
-                        if current_time - last_frame_time < frame_interval:
-                            continue  # Skip this frame to maintain target FPS
-                        
+                        elapsed = current_time - last_frame_time
+                        if elapsed < frame_interval:
+                            continue  
+
                         last_frame_time = current_time
+                        fps_sample = (1.0 / elapsed) if elapsed > 0 else None
                         
                         try:
-                            # Decode the frame
+                            capture_ts_ms = None
+                            try:
+                                key_bytes = getattr(message, "key", None)
+                                if key_bytes:
+                                    key_str = key_bytes.decode("utf-8", errors="ignore")
+                                    ts_part = key_str.split(":", 1)[0]
+                                    capture_ts_ms = int(ts_part)
+                            except Exception:
+                                capture_ts_ms = None
+
                             frame_data = message.value
                             
-                            # Only log every 100th frame to reduce console spam
                             if frame_counter % 100 == 0:
                                 print(f"[Kafka Consumer {camera.upper()}] Processing frame {frame_counter}, data size: {len(frame_data)} bytes")
                             
-                            # Decode image from bytes
                             frame_buffer = np.frombuffer(frame_data, dtype=np.uint8)
                             final_img = cv2.imdecode(frame_buffer, cv2.IMREAD_COLOR)
                             
@@ -312,31 +459,32 @@ def kafka_consumer_thread(session_id: str, camera: str):
                                 print(f"[Kafka Consumer {camera.upper()}] ERROR: Could not decode image, skipping...")
                                 continue
 
-                            # Encode frame to JPEG for web transmission
                             _, buffer = cv2.imencode('.jpg', final_img, [cv2.IMWRITE_JPEG_QUALITY, 80])
                             frame_b64 = base64.b64encode(buffer).decode('utf-8')
                             
-                            # Create the message dictionary
                             websocket_message = {
                                 "type": "frame",
                                 "camera": camera,
                                 "data": frame_b64,
                                 "timestamp": datetime.now().isoformat(),
-                                "frame_count": frame_counter + 1
+                                "frame_count": frame_counter + 1,
+                                "capture_ts_ms": capture_ts_ms,
                             }
                             
-                            # Send to WebSocket via the main event loop
                             websocket_queue.put((session_id, websocket_message))
-                            
-                            # Clean up memory immediately
+
                             del frame_buffer, final_img, buffer, frame_b64
                             frame_counter += 1
                             
-                            # More frequent garbage collection
                             if frame_counter % 50 == 0:
                                 import gc
                                 gc.collect()
                                 
+                            session_metrics = active_sessions.get(session_id, {}).get("metrics")
+                            if session_metrics:
+                                if fps_sample:
+                                    session_metrics.record_frontend_fps(camera, fps_sample)
+
                         except Exception as e:
                             print(f"[Kafka Consumer {camera.upper()}] Error processing message: {e}")
                             continue
@@ -344,8 +492,8 @@ def kafka_consumer_thread(session_id: str, camera: str):
             except Exception as e:
                 print(f"[Kafka Consumer {camera.upper()}] Error in consumer loop: {e}")
                 consecutive_timeouts += 1
-                time.sleep(1)  # Wait before retrying
-                    
+                time.sleep(1)
+
         print(f"[Kafka Consumer {camera.upper()}] Consumer loop ended")
                 
     except Exception as e:
@@ -360,7 +508,6 @@ def kafka_consumer_thread(session_id: str, camera: str):
             pass
 
 def matching_monitor_thread(session_id: str):
-    """Thread function to monitor matching folder for new vehicle matches"""
     matching_dir = BASE_DIR.parent / "matching"
     processed_files = set()
     
@@ -368,12 +515,10 @@ def matching_monitor_thread(session_id: str):
     
     while session_id in active_sessions:
         try:
-            # Check for new matching files
             for file_path in matching_dir.glob("*.jpg"):
                 if file_path.name not in processed_files:
                     processed_files.add(file_path.name)
                     
-                    # Send matching notification
                     websocket_message = {
                         "type": "match",
                         "filename": file_path.name,
@@ -381,11 +526,10 @@ def matching_monitor_thread(session_id: str):
                         "timestamp": datetime.now().isoformat()
                     }
                     
-                    # Put the message in the queue to be sent by the main loop
                     websocket_queue.put((session_id, websocket_message))
                     print(f"[Matching Monitor] Match found and queued: {file_path.name}")
             
-            time.sleep(1)  # Check every second
+            time.sleep(1)
             
         except Exception as e:
             print(f"[Matching Monitor] Error: {e}")
@@ -395,21 +539,17 @@ def matching_monitor_thread(session_id: str):
 
 @app.get("/latest_matches")
 async def get_latest_matches():
-    """Get the latest cross-camera matching images from the filesystem."""
     matching_dir = BASE_DIR.parent / "matching"
     
     try:
         image_files = []
         
-        # Debug log for troubleshooting
         print(f"[Latest Matches] Looking for images in {matching_dir}")
         
-        # First, get all image files directly from the matching folder (flat structure)
         flat_files = list(matching_dir.glob("*.jpg"))
         image_files.extend(flat_files)
         print(f"[Latest Matches] Found {len(flat_files)} flat files")
         
-        # Then, get all image files from subdirectories (legacy structure)
         for subdir in matching_dir.iterdir():
             if subdir.is_dir():
                 subdir_files = list(subdir.glob("*.jpg"))
@@ -419,7 +559,6 @@ async def get_latest_matches():
         print(f"[Latest Matches] Total images found: {len(image_files)}")
         
         if not image_files:
-            # For testing: use some hardcoded test images if none are found
             test_dir = matching_dir / "test1"
             if test_dir.exists():
                 test_images = list(test_dir.glob("*.jpg"))
@@ -427,17 +566,13 @@ async def get_latest_matches():
                     print(f"[Latest Matches] Found {len(test_images)} test images in {test_dir}")
                     image_files.extend(test_images)
         
-        # Sort by modification time (newest first)
         image_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
         
         matches = []
-        # Limit to the latest 20 matches
         for img_path in image_files[:20]:
             
-            # Calculate the relative path from the matching directory
             relative_path = img_path.relative_to(matching_dir)
             
-            # Create camera tag based on filename or path
             camera_tag = "cam1" if "cam1" in img_path.name.lower() else "cam2" if "cam2" in img_path.name.lower() else "cam1" if "test1" in str(img_path) else "cam2"
             
             matches.append({
@@ -460,17 +595,14 @@ async def get_latest_matches():
 
 @app.get("/", response_class=HTMLResponse)
 async def read_root():
-    """Serve the main HTML page"""
     template_path = BASE_DIR / "templates" / "index.html"
     with open(template_path, "r", encoding="utf-8") as f:
         return HTMLResponse(content=f.read())
 
 @app.post("/start_session")
 async def start_session():
-    """Start a new processing session"""
     session_id = str(uuid.uuid4())[:8]
     
-    # Create session data
     session_data = {
         "id": session_id,
         "status": "initialized",
@@ -478,7 +610,8 @@ async def start_session():
         "cameras": {"cam1": None, "cam2": None},
         "spark_thread": None,
         "kafka_threads": {"cam1": None, "cam2": None},
-        "matching_thread": None
+        "matching_thread": None,
+        "metrics": SessionMetrics(session_id),
     }
     
     active_sessions[session_id] = session_data
@@ -489,7 +622,6 @@ async def start_session():
 
 @app.post("/upload_video/{session_id}")
 async def upload_video(session_id: str, camera: str, file: UploadFile = File(...)):
-    """Upload video for a specific camera"""
     if session_id not in active_sessions:
         raise HTTPException(status_code=404, detail="Session not found")
     
@@ -514,7 +646,6 @@ async def upload_video(session_id: str, camera: str, file: UploadFile = File(...
 
 @app.post("/start_processing/{session_id}")
 async def start_processing(session_id: str):
-    """Start processing the uploaded videos"""
     if session_id not in active_sessions:
         raise HTTPException(status_code=404, detail="Session not found")
     
@@ -523,35 +654,35 @@ async def start_processing(session_id: str):
     # Check if both videos are uploaded
     if not session_data["cameras"]["cam1"] or not session_data["cameras"]["cam2"]:
         raise HTTPException(status_code=400, detail="Both camera videos must be uploaded")
-    
+
     try:
-        # Create Kafka topics first
         print(f"[Processing] Creating Kafka topics for session {session_id}")
         ensure_kafka_topic(session_id, bootstrap_servers='localhost:9092')
         
-        # Start Spark streaming, passing the absolute base directory
         print(f"[Processing] Starting Spark streaming for session {session_id}")
-        # The base directory for spark is the root of the Vehicle-Re-ID project
         spark_base_dir = BASE_DIR.parent 
-        spark_thread = start_spark(session_id, base_dir=spark_base_dir)
+        session_data["metrics"].start_spark_run()
+        spark_thread = start_spark(
+            session_id,
+            base_dir=spark_base_dir,
+            progress_callback=session_data["metrics"].record_micro_batch,
+            session_metrics=session_data["metrics"],
+        )
         session_data["spark_thread"] = spark_thread
         
-        # Wait for Spark to initialize
         print(f"[Processing] Waiting for Spark to initialize...")
-        await asyncio.sleep(30)  # Increased to 30 seconds to ensure Spark is ready
+        await asyncio.sleep(30)  
         
         # Start video producers
         print(f"[Processing] Starting video producers for session {session_id}")
-        
-        # Start cam1 producer with controlled frame rate
+
         producer1 = VideoProducer(
             topic=f"cam1_{session_id}",
             bootstrap_servers="localhost:9092",
-            fps=6.0,  # Set to 6 FPS for controlled streaming
+            fps=6.0, 
             mode='streaming'
         )
         
-        # Start cam2 producer with controlled frame rate
         producer2 = VideoProducer(
             topic=f"cam2_{session_id}",
             bootstrap_servers="localhost:9092",
@@ -559,32 +690,26 @@ async def start_processing(session_id: str):
             mode='streaming'
         )
         
-        # Start producers in threads
         producer1_thread = threading.Thread(target=producer1.start_streaming, args=(session_data["cameras"]["cam1"],))
         producer2_thread = threading.Thread(target=producer2.start_streaming, args=(session_data["cameras"]["cam2"],))
         
         producer1_thread.start()
         producer2_thread.start()
         
-        # Start Kafka consumer threads for each camera
         print(f"[Processing] Starting Kafka consumer threads for session {session_id}")
         
-        # Consumer for cam1
         kafka_thread_cam1 = threading.Thread(target=kafka_consumer_thread, args=(session_id, "cam1"))
         kafka_thread_cam1.start()
         session_data["kafka_threads"]["cam1"] = kafka_thread_cam1
         
-        # Consumer for cam2
         kafka_thread_cam2 = threading.Thread(target=kafka_consumer_thread, args=(session_id, "cam2"))
         kafka_thread_cam2.start()
         session_data["kafka_threads"]["cam2"] = kafka_thread_cam2
         
-        # Start matching monitor thread
         matching_thread = threading.Thread(target=matching_monitor_thread, args=(session_id,))
         matching_thread.start()
         session_data["matching_thread"] = matching_thread
         
-        # Update session status
         session_data["status"] = "processing"
         session_data["processing_start_time"] = datetime.now().isoformat()
         
@@ -599,18 +724,24 @@ async def start_processing(session_id: str):
     except Exception as e:
         print(f"[Processing] Error starting processing: {e}")
         session_data["status"] = "error"
+        metrics = session_data.get("metrics")
+        if metrics:
+            metrics.stop_spark_run()
+            metrics.print_summary(prefix=f"Session {session_id} metrics before failure")
         raise HTTPException(status_code=500, detail=f"Error starting processing: {str(e)}")
 
 @app.post("/stop_processing/{session_id}")
 async def stop_processing(session_id: str):
-    """Stop processing for a session"""
     if session_id not in active_sessions:
         raise HTTPException(status_code=404, detail="Session not found")
     
     session_data = active_sessions[session_id]
     session_data["status"] = "stopping"
+    metrics = session_data.get("metrics")
+    if metrics:
+        metrics.stop_spark_run()
+        metrics.print_summary(prefix=f"Session {session_id} final metrics")
     
-    # Clean up session
     if session_id in active_sessions:
         del active_sessions[session_id]
     
@@ -620,13 +751,11 @@ async def stop_processing(session_id: str):
 
 @app.get("/session_status/{session_id}")
 async def get_session_status(session_id: str):
-    """Get the status of a session"""
     if session_id not in active_sessions:
         raise HTTPException(status_code=404, detail="Session not found")
     
     session_data = active_sessions[session_id]
     
-    # Get additional status information
     spark_thread_alive = False
     kafka_threads_alive = {"cam1": False, "cam2": False}
     matching_thread_alive = False
@@ -665,18 +794,15 @@ async def get_session_status(session_id: str):
 
 @app.websocket("/ws/{session_id}")
 async def websocket_endpoint(websocket: WebSocket, session_id: str):
-    """WebSocket endpoint for real-time frame streaming with heartbeat mechanism"""
     await manager.connect(websocket, session_id)
     
-    heartbeat_interval = 30  # Send a heartbeat every 30 seconds to keep connection alive
+    heartbeat_interval = 30  
     last_heartbeat = time.time()
     
     try:
         while True:
-            # Use a short sleep to keep the connection responsive
             await asyncio.sleep(0.5)
-            
-            # Send a lightweight heartbeat message periodically
+     
             current_time = time.time()
             if current_time - last_heartbeat >= heartbeat_interval:
                 try:
@@ -696,7 +822,6 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 
 @app.get("/matching_files")
 async def get_matching_files():
-    """Get list of matching files"""
     matching_dir = BASE_DIR.parent / "matching"
     files = []
     
@@ -712,7 +837,6 @@ async def get_matching_files():
 
 @app.get("/debug/{session_id}")
 async def debug_session(session_id: str):
-    """Debug endpoint to check session status and components"""
     debug_info = {
         "session_id": session_id,
         "session_exists": session_id in active_sessions,
@@ -723,7 +847,6 @@ async def debug_session(session_id: str):
         "matching_files": 0
     }
     
-    # Check session data
     if session_id in active_sessions:
         session_data = active_sessions[session_id]
         debug_info["session_status"] = session_data["status"]
@@ -738,7 +861,6 @@ async def debug_session(session_id: str):
             "matching_thread": session_data["matching_thread"] is not None
         }
     
-    # Check Kafka topics
     try:
         from kafka.admin import KafkaAdminClient
         admin_client = KafkaAdminClient(bootstrap_servers=['localhost:9092'])
@@ -773,7 +895,6 @@ async def debug_session(session_id: str):
         except Exception as e:
             debug_info["database_error"] = str(e)
     
-    # Check matching files
     matching_dir = BASE_DIR.parent / "matching"
     if matching_dir.exists():
         debug_info["matching_files"] = len(list(matching_dir.glob("*.jpg")))
@@ -782,7 +903,6 @@ async def debug_session(session_id: str):
 
 @app.get("/debug_page", response_class=HTMLResponse)
 async def debug_page():
-    """Serve the debug HTML page"""
     debug_template_path = BASE_DIR / "debug.html"
     with open(debug_template_path, "r", encoding="utf-8") as f:
         return HTMLResponse(content=f.read())
@@ -790,7 +910,6 @@ async def debug_page():
 
 @app.post("/test_websocket/{session_id}")
 async def test_websocket(session_id: str):
-    """Test WebSocket connection by sending a test message"""
     if session_id not in manager.active_connections:
         return {"error": "WebSocket not connected for this session"}
     
@@ -811,7 +930,6 @@ async def test_websocket(session_id: str):
 
 @app.post("/test_frame/{session_id}")
 async def test_frame(session_id: str, camera: str = "cam1"):
-    """Send a test frame to WebSocket for debugging"""
     if session_id not in manager.active_connections:
         return {"error": "WebSocket not connected for this session"}
     
@@ -819,31 +937,25 @@ async def test_frame(session_id: str, camera: str = "cam1"):
         return {"error": "Camera must be 'cam1' or 'cam2'"}
     
     try:
-        # Create a simple test image
         import numpy as np
         import cv2
         import base64
         
-        # Create a colored test image with timestamp
         height, width = 480, 640
         test_img = np.zeros((height, width, 3), dtype=np.uint8)
         
-        # Different colors for different cameras
         if camera == "cam1":
-            test_img[:, :] = [255, 0, 0]  # Red
+            test_img[:, :] = [255, 0, 0]
         else:
-            test_img[:, :] = [0, 255, 0]  # Green
+            test_img[:, :] = [0, 255, 0]  
         
-        # Add timestamp text
         timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         cv2.putText(test_img, f"{camera.upper()} - {timestamp}", (50, 50), 
                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
         
-        # Encode to base64
         _, buffer = cv2.imencode('.jpg', test_img)
         frame_b64 = base64.b64encode(buffer).decode('utf-8')
         
-        # Send test frame
         websocket_message = {
             "type": "frame",
             "camera": camera,
@@ -864,11 +976,9 @@ async def test_frame(session_id: str, camera: str = "cam1"):
         return {"error": f"Failed to send test frame: {str(e)}"}
 @app.get("/matching_resized/{filename}")
 async def get_resized_matching_image(filename: str, width: int = 90, height: int = 120):
-    """Serve a resized version of a matching image"""
     try:
         matching_dir = BASE_DIR.parent / "matching"
         
-        # Clean filename by removing any camera prefix (cam1_, cam2_)
         clean_filename = filename
         if clean_filename.startswith(("cam1_", "cam2_")):
             clean_filename = clean_filename[5:]  # Remove the prefix
@@ -956,7 +1066,6 @@ async def get_resized_matching_image(filename: str, width: int = 90, height: int
 
 @app.get("/test_resize")
 async def test_resize():
-    """Test endpoint to verify image resizing works"""
     try:
         matching_dir = BASE_DIR.parent / "matching"
         
@@ -992,4 +1101,15 @@ async def test_resize():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="localhost", port=8000)
+    import os
+
+    try:
+        uvicorn.run(app, host="localhost", port=8000)
+    except KeyboardInterrupt:
+        print("\n[FastAPI] KeyboardInterrupt received. Printing session metrics before exit...")
+        for session_id, session in list(active_sessions.items()):
+            metrics = session.get("metrics")
+            if metrics:
+                metrics.stop_spark_run()
+                metrics.print_summary(prefix=f"Session {session_id} final metrics")
+        print("[FastAPI] Shutdown complete.")

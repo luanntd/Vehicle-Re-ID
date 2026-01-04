@@ -2,6 +2,9 @@ import cv2
 import numpy as np
 from datetime import datetime
 
+from dataclasses import dataclass
+from typing import List, Tuple
+
 from .reid_chromadb import ChromaDBVehicleReID
 from .feature_extraction import VehicleDescriptor
 from .vehicle_detection import VehicleDetector
@@ -18,45 +21,37 @@ class Pipeline:
         self.descriptor = descriptor or VehicleDescriptor(model_type='osnet')
         self.classifier = classifier or ChromaDBVehicleReID(db_path=db_path)
         
-        # Track processed vehicles to avoid duplicate cross-camera saves
         self.processed_cross_camera = set()
 
     def process(self, frame, camera_id, save_cross_camera_images=True):
         try:
             VEHICLE_LABELS = {0: 'motorcycle', 1: 'car', 2: 'truck', 3: 'bus'}
             
-            # Use direct frame tracking to avoid encoding/decoding
             detected_data = self.detector.track(frame, camera_id)
             if len(detected_data) == 1:
                 detected_data = detected_data[0]
             
-            # Work directly with the input frame
             final_img = frame.copy()
             current_timestamp = datetime.now().isoformat()
             
             for detected_box in detected_data.boxes:
-                # Get bounding box coordinates
                 xyxy = detected_box.xyxy.squeeze().tolist()
                 xmin, ymin, xmax, ymax = map(int, xyxy)
                 
-                # Ensure coordinates are within frame bounds
                 xmin = max(0, xmin)
                 ymin = max(0, ymin)
                 xmax = min(frame.shape[1], xmax)
                 ymax = min(frame.shape[0], ymax)
                 
-                # Get detected class (vehicle type)
                 cls = int(detected_box.cls)
                 conf = float(detected_box.conf)
                 track_id = int(detected_box.id) if detected_box.id is not None else -1
 
-                # Crop vehicle image
                 vehicle_img = frame[ymin:ymax, xmin:xmax, :]
                 
                 if vehicle_img.size == 0:
                     continue
 
-                # Extract features and identify vehicle using ChromaDB
                 vehicle_features = self.descriptor.extract_feature(vehicle_img)
                 vehicle_id = self.classifier.identify(
                     target=vehicle_features,
@@ -69,7 +64,6 @@ class Pipeline:
                     timestamp=current_timestamp
                 )
                 
-                # Check for cross-camera matches and save images
                 if save_cross_camera_images:
                     camera_matches = self.classifier.get_cross_camera_matches(vehicle_id, cls)
                     if len(camera_matches) > 1:
@@ -80,11 +74,9 @@ class Pipeline:
                             self.classifier.save_cross_camera_images(vehicle_id, cls, camera_matches)
                             self.processed_cross_camera.add(vehicle_key)
 
-                # Create label with vehicle ID and type
                 vehicle_type = VEHICLE_LABELS.get(cls, f'class_{cls}')
                 label = f"ID:{vehicle_id} ({vehicle_type})"
 
-                # Draw bounding box and label
                 unique_color = color.create_unique_color(vehicle_id)
                 cv2.rectangle(
                     img=final_img,
@@ -107,14 +99,12 @@ class Pipeline:
             
         except Exception as e:
             print(f"Error processing frame: {e}")
-            return frame  # Return original frame if processing fails
+            return frame 
     
     def get_pipeline_statistics(self):
-        """Get statistics about the pipeline's performance."""
         return self.classifier.get_statistics()
     
     def save_vehicle_database(self):
-        """Save the current state of the vehicle database."""
         stats = self.get_pipeline_statistics()
         print("Current database statistics:")
         for vehicle_type, count in stats.items():
@@ -123,6 +113,72 @@ class Pipeline:
         print(f"Total: {stats['total']} embeddings")
         
     def close(self):
-        """Close pipeline and database connections."""
         self.classifier.close()
+        print("Pipeline closed successfully")
+
+@dataclass
+class DetectionPayload:
+    camera_id: str
+    track_id: int
+    vehicle_type: int
+    confidence: float
+    timestamp: str
+    bbox: Tuple[int, int, int, int]
+    image: np.ndarray
+    feature: np.ndarray         
+    thumbnail: bytes 
+
+class Pipeline_spark:
+    def __init__(
+        self,
+        detector: VehicleDetector = None,
+        descriptor: VehicleDescriptor = None,
+    ) -> None:
+        self.detector = detector or VehicleDetector()
+        self.descriptor = descriptor or VehicleDescriptor(model_type="osnet")
+
+    def process(
+        self,
+        frame: np.ndarray,
+        camera_id: str,
+    ) -> Tuple[np.ndarray, List[DetectionPayload]]:
+            
+        detected = self.detector.track(frame, camera_id)
+        if len(detected) == 1:
+            detected = detected[0]
+
+        timestamp = datetime.now().isoformat()
+        payloads: List[DetectionPayload] = []
+
+        for box in detected.boxes:
+            xmin, ymin, xmax, ymax = map(int, box.xyxy.squeeze().tolist())
+            xmin = max(0, xmin)
+            ymin = max(0, ymin)
+            xmax = min(frame.shape[1], xmax)
+            ymax = min(frame.shape[0], ymax)
+
+            patch = frame[ymin:ymax, xmin:xmax]
+            if patch.size == 0:
+                continue
+
+            embedding = self.descriptor.extract_feature(patch)
+            success, encoded = cv2.imencode(".jpg", patch)
+            if not success:
+                continue
+
+            payload = DetectionPayload(
+                camera_id=camera_id,
+                track_id=int(box.id) if box.id is not None else -1,
+                vehicle_type=int(box.cls),
+                confidence=float(box.conf),
+                timestamp=timestamp,
+                bbox=(xmin, ymin, xmax, ymax),
+                image=patch,
+                feature=embedding,
+                thumbnail=encoded.tobytes(),
+            )
+            payloads.append(payload)
+
+        return payloads
+    def close(self):
         print("Pipeline closed successfully")
